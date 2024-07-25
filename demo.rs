@@ -28,3 +28,7 @@ fn all_zero(mut x : &mut List) {
     x = tl;
   }
 }
+
+fn swap<'a, 'b, T, U>(x : (&'a mut T, &'b mut U)) -> (&'b mut U, &'a mut T) {
+  (x.1, x.0)
+}
