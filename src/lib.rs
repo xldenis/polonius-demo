@@ -3,18 +3,19 @@
 #![feature(let_chains, never_type, try_blocks)]
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 };
 
 use rustc_borrowck::consumers::{
-    get_body_with_borrowck_facts, BodyWithBorrowckFacts, ConsumerOptions,
+    get_body_with_borrowck_facts, BodyWithBorrowckFacts, BorrowIndex, ConsumerOptions, RustcFacts,
 };
 use rustc_hir::def_id::LocalDefId;
 use rustc_interface::Config;
 use rustc_middle::{
     mir::{traversal::reverse_postorder, BorrowKind, Rvalue, StatementKind},
-    ty::{self, Region, Ty, TyCtxt, TyKind},
+    ty::{self, Region, RegionVid, Ty, TyCtxt, TyKind},
 };
 
 // #[macro_use]
@@ -42,6 +43,52 @@ extern crate rustc_span;
 extern crate rustc_target;
 extern crate rustc_trait_selection;
 extern crate rustc_type_ir;
+
+#[derive(Clone, Debug, PartialEq)]
+struct BorrowckState<'a>(
+    &'a [BorrowIndex],
+    &'a [RegionVid],
+    Cow<'a, BTreeMap<RegionVid, BTreeSet<RegionVid>>>,
+    Cow<'a, BTreeMap<RegionVid, BTreeSet<BorrowIndex>>>,
+);
+
+fn state<'a>(out: &'a polonius_engine::Output<RustcFacts>, ix: usize) -> BorrowckState<'a> {
+    let ix = ix.into();
+
+    BorrowckState(
+        out.loans_in_scope_at(ix),
+        out.origins_live_at(ix),
+        out.subsets_at(ix),
+        out.origin_contains_loan_at(ix),
+    )
+}
+
+fn real_origin_live_at<'a>(
+    out: &'a polonius_engine::Output<RustcFacts>,
+    ix: usize,
+) -> BTreeSet<RegionVid> {
+    let ix = ix.into();
+    let mut live = out.origins_live_at(ix).to_vec();
+    let subsets = out.subsets_at(ix);
+    let mut flipped_subsets: BTreeMap<_, BTreeSet<_>> = Default::default();
+    for (i, subs) in subsets.iter() {
+        for s in subs {
+            flipped_subsets.entry(s).or_default().insert(i);
+        }
+    }
+    let mut to_expand: Vec<_> = live.iter().cloned().collect();
+    to_expand.extend(out.origin_contains_loan_at(ix).keys());
+    let mut visited: HashSet<_> = Default::default();
+    while let Some(reg) = to_expand.pop() {
+        if visited.insert(reg) {
+            let supers = flipped_subsets.get(&reg).cloned().unwrap_or_default();
+            to_expand.extend(supers.clone());
+            live.extend(supers);
+        }
+    }
+
+    visited.into_iter().collect()
+}
 
 fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
     // let a = get_body_with_borrowck_facts(
@@ -98,7 +145,7 @@ fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
         .map(|(src, tgt, _)| (src, tgt))
         .collect();
     // eprintln!("{:?}", input_facts.subset_base);
-    eprintln!("{:?}", output_facts);
+    // eprintln!("{:?}", output_facts);
     // eprintln!("{:?}", input_facts.subset_base);
     for (bb, bbd) in reverse_postorder(&a.body) {
         println!("{bb:?}");
@@ -109,32 +156,44 @@ fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
                 let ix = location_table.mid_index(loc);
                 let old = location_table.start_index(loc);
 
-                let mut old_regions: HashSet<_> =
-                    output_facts.origins_live_at(old).iter().collect();
-                let old_derived = output_facts.origin_contains_loan_at(old);
-                old_regions.extend(old_derived.keys());
-                let mut new_regions: HashSet<_> = output_facts.origins_live_at(ix).iter().collect();
-                let ix_derived = output_facts.origin_contains_loan_at(ix);
-                new_regions.extend(ix_derived.keys());
+                let old_regions = real_origin_live_at(&output_facts, old.into());
 
-                eprintln!(
-                    "loans={:?} origins={:?} subsets={:?} origin_contains={:?}",
-                    output_facts.loans_in_scope_at(old),
-                    output_facts.origins_live_at(old),
-                    output_facts.subsets_at(old),
-                    output_facts.origin_contains_loan_at(old)
-                );
+                // let mut old_regions: HashSet<_> =
+                //     output_facts.origins_live_at(old).iter().collect();
+                // let old_derived = output_facts.origin_contains_loan_at(old);
+                // old_regions.extend(old_derived.keys());
 
-                eprintln!(
-                    "loans={:?} origins={:?} subsets={:?} origin_contains={:?}",
-                    output_facts.loans_in_scope_at(ix),
-                    output_facts.origins_live_at(ix),
-                    output_facts.subsets_at(ix),
-                    output_facts.origin_contains_loan_at(ix)
-                );
+                let new_regions = real_origin_live_at(&output_facts, ix.into());
 
-                for r in new_regions.difference(&old_regions) {
-                    println!("  newlft({r:?})");
+                // let mut new_regions: HashSet<_> = output_facts.origins_live_at(ix).iter().collect();
+                // let ix_derived = output_facts.origin_contains_loan_at(ix);
+                // new_regions.extend(ix_derived.keys());
+
+                let old = state(&output_facts, old.into());
+                let ix_state = state(&output_facts, ix.into());
+                if old != ix_state {
+                    // eprintln!(
+                    //     "loans={:?} origins={:?} subsets={:?} origin_contains={:?}",
+                    //     old.0, old.1, old.2, old.3
+                    // );
+                }
+
+                // eprintln!(
+                //     "loans={:?} origins={:?} subsets={:?} origin_contains={:?} real_origins={:?}",
+                //     ix_state.0,
+                //     ix_state.1,
+                //     ix_state.2,
+                //     ix_state.3,
+                //     real_origin_live_at(&output_facts, ix.into()),
+                // );
+
+                let news: BTreeSet<_> = new_regions.difference(&old_regions).collect();
+                if !news.is_empty() {
+                    print!("  newlft(");
+                    for r in news {
+                        print!("{r:?}, ");
+                    }
+                    println!(")");
                 }
             }
             // Instruction
@@ -174,17 +233,27 @@ fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
                 let old = location_table.mid_index(old);
                 let ix = location_table.start_index(loc);
 
-                let mut old_regions: HashSet<_> =
-                    output_facts.origins_live_at(old).iter().collect();
-                let old_derived = output_facts.origin_contains_loan_at(old);
-                old_regions.extend(old_derived.keys());
+                let old_regions = real_origin_live_at(&output_facts, old.into());
 
-                let mut new_regions: HashSet<_> = output_facts.origins_live_at(ix).iter().collect();
-                let ix_derived = output_facts.origin_contains_loan_at(ix);
-                new_regions.extend(ix_derived.keys());
+                let new_regions = real_origin_live_at(&output_facts, ix.into());
 
-                for r in old_regions.difference(&new_regions) {
-                    println!("  endlft({r:?})");
+                // let mut old_regions: HashSet<_> =
+                //     output_facts.origins_live_at(old).iter().collect();
+                // let old_derived = output_facts.origin_contains_loan_at(old);
+                // old_regions.extend(old_derived.keys());
+
+                // let mut new_regions: HashSet<_> = output_facts.origins_live_at(ix).iter().collect();
+                // let ix_derived = output_facts.origin_contains_loan_at(ix);
+                // new_regions.extend(ix_derived.keys());
+
+
+                 let deads: BTreeSet<_> = old_regions.difference(&new_regions).collect();
+                if !deads.is_empty() {
+                    print!("  endlft(");
+                    for r in deads {
+                        print!("{r:?}, ");
+                    }
+                    println!(")");
                 }
             }
         }
@@ -203,6 +272,7 @@ thread_local! {
 }
 
 use rustc_driver::Callbacks;
+use rustc_session::config::OutputFilenames;
 
 pub struct PoloniusDemo;
 
