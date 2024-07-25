@@ -1,17 +1,23 @@
 #![feature(rustc_private, register_tool)]
-#![feature(box_syntax, box_patterns, control_flow_enum, drain_filter)]
+#![feature(box_patterns, control_flow_enum)]
 #![feature(let_chains, never_type, try_blocks)]
 
-use std::collections::{HashSet, HashMap};
-
-use rustc_borrowck::consumers::get_body_with_borrowck_facts;
-use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_middle::{
-    mir::{self, traversal::reverse_postorder, BorrowKind, Rvalue, StatementKind},
-    ty::{self, TyCtxt, TyKind, WithOptConstParam},
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
 };
 
-#[macro_use]
+use rustc_borrowck::consumers::{
+    get_body_with_borrowck_facts, BodyWithBorrowckFacts, ConsumerOptions,
+};
+use rustc_hir::def_id::LocalDefId;
+use rustc_interface::Config;
+use rustc_middle::{
+    mir::{traversal::reverse_postorder, BorrowKind, Rvalue, StatementKind},
+    ty::{self, Region, Ty, TyCtxt, TyKind},
+};
+
+// #[macro_use]
 extern crate log;
 extern crate polonius_engine;
 extern crate rustc_ast;
@@ -38,9 +44,24 @@ extern crate rustc_trait_selection;
 extern crate rustc_type_ir;
 
 fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
-    let a = get_body_with_borrowck_facts(tcx, WithOptConstParam::unknown(def_id));
-    let location_table = a.location_table;
-    let mut input_facts = a.input_facts;
+    // let a = get_body_with_borrowck_facts(
+    //     tcx,
+    //     def_id,
+    //     rustc_borrowck::consumers::ConsumerOptions::PoloniusOutputFacts,
+    // );
+    let a: BodyWithBorrowckFacts = MIR_BODIES
+        .with(|state| {
+            let mut map = state.borrow_mut();
+            // SAFETY: For soundness we need to ensure that the bodies have
+            // the same lifetime (`'tcx`), which they had before they were
+            // stored in the thread local.
+            map.remove(&def_id)
+                .map(|body| unsafe { std::mem::transmute(body) })
+        })
+        .expect("expected to find body");
+
+    let location_table = a.location_table.unwrap();
+    let input_facts = a.input_facts.unwrap();
     // let entry_block = mir::START_BLOCK;
     // let entry_point = location_table.start_index(mir::Location {
     //     block: entry_block,
@@ -59,7 +80,7 @@ fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
 
     // let b = tcx.mir_borrowck(def_id);
     let output_facts =
-        polonius_engine::Output::compute(&input_facts, polonius_engine::Algorithm::Naive, true);
+        polonius_engine::Output::compute(&*input_facts, polonius_engine::Algorithm::Naive, true);
 
     for (loc, decl) in a.body.local_decls.iter_enumerated() {
         match decl.ty.kind() {
@@ -71,7 +92,11 @@ fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
     }
     eprintln!("");
 
-    let base : HashMap<_, _> = input_facts.subset_base.iter().map(|(src, tgt, _)| (src, tgt)).collect();
+    let base: HashMap<_, _> = input_facts
+        .subset_base
+        .iter()
+        .map(|(src, tgt, _)| (src, tgt))
+        .collect();
     // eprintln!("{:?}", input_facts.subset_base);
     eprintln!("{:?}", output_facts);
     // eprintln!("{:?}", input_facts.subset_base);
@@ -119,15 +144,20 @@ fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
                         let mut_ = match kind {
                             BorrowKind::Mut { .. } => "mut",
                             BorrowKind::Shared => "shared",
-                            BorrowKind::Shallow => "shallow",
-                            BorrowKind::Unique => "unique",
+                            BorrowKind::Fake(_) => "fake(_)",
+                            // BorrowKind::Shallow => "shallow",
+                            // BorrowKind::Unique => "unique",
                         };
 
                         let subsets = output_facts.subsets_at(location_table.mid_index(loc));
 
-                        let reg = if let ty::ReVar(vid) = reg.kind() && let Some(sub) = base.get(&vid) {
-                            tcx.mk_region(ty::ReVar(**sub))
-                        } else { *reg };
+                        let reg = if let ty::ReVar(vid) = reg.kind()
+                            && let Some(sub) = base.get(&vid)
+                        {
+                            Region::new_var(tcx, **sub)
+                        } else {
+                            *reg
+                        };
                         // eprintln!("{:?}", subsets.get(reg));
                         println!("  {l:?} = & {reg:?} {mut_} {r:?}");
                     }
@@ -166,11 +196,39 @@ fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
     // println!("{:?}", output_facts.origin_live_on_entry);
 }
 
+thread_local! {
+    pub static MIR_BODIES:
+        RefCell<HashMap<LocalDefId, BodyWithBorrowckFacts<'static>>> =
+        RefCell::new(HashMap::new());
+}
+
 use rustc_driver::Callbacks;
 
 pub struct PoloniusDemo;
 
 impl Callbacks for PoloniusDemo {
+    fn config(&mut self, config: &mut Config) {
+        config.override_queries = Some(|_sess, providers| {
+            providers.mir_borrowck = |tcx, def_id| {
+                let opts = ConsumerOptions::PoloniusOutputFacts;
+
+                let body_with_facts =
+                    rustc_borrowck::consumers::get_body_with_borrowck_facts(tcx, def_id, opts);
+
+                // SAFETY: The reader casts the 'static lifetime to 'tcx before using it.
+                let body_with_facts: BodyWithBorrowckFacts<'static> =
+                    unsafe { std::mem::transmute(body_with_facts) };
+
+                MIR_BODIES.with(|state| {
+                    let mut map = state.borrow_mut();
+                    assert!(map.insert(def_id, body_with_facts).is_none());
+                });
+
+                (rustc_interface::DEFAULT_QUERY_PROVIDERS.mir_borrowck)(tcx, def_id)
+            }
+        });
+    }
+
     fn after_analysis<'tcx>(
         &mut self,
         _compiler: &rustc_interface::interface::Compiler,
