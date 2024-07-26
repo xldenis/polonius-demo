@@ -1,8 +1,10 @@
+use std::ops::Deref;
 use std::{collections::HashMap, rc::Rc};
 
 use rustc_ast::Mutability;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_middle::mir::{BasicBlock, BorrowKind, Place, Terminator};
+use rustc_middle::mir::{BasicBlock, BorrowKind, Place, Rvalue, Terminator};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::{
     mir::{self, Local, Operand, ProjectionElem, Statement},
@@ -27,7 +29,42 @@ enum SymValueI<'tcx> {
     Bot,
 }
 
-type SymValue<'tcx> = Rc<SymValueI<'tcx>>;
+#[derive(Clone)]
+struct SymValue<'tcx>(Rc<SymValueI<'tcx>>);
+
+impl<'tcx> SymValue<'tcx> {
+    fn constructor(id: DefId, args: GenericArgsRef<'tcx>, fields: Vec<Self>) -> Self {
+        SymValue(Rc::new(SymValueI::Constructor { id, args, fields }))
+    }
+
+    fn borrow(m: Mutability, l: LoanId, v: Self) -> Self {
+        SymValue(Rc::new(SymValueI::Borrow(m, l, v)))
+    }
+
+    fn loan(l: LoanId) -> Self {
+        SymValue(Rc::new(SymValueI::Loan(l)))
+    }
+
+    fn tuple(fields: Vec<Self>) -> Self {
+        SymValue(Rc::new(SymValueI::Tuple(fields)))
+    }
+
+    fn bot() -> Self {
+        SymValue(Rc::new(SymValueI::Bot))
+    }
+
+    fn symbolic(ty: Ty<'tcx>, id: usize) -> Self {
+        SymValue(Rc::new(SymValueI::Symbolic(ty, id)))
+    }
+}
+
+impl<'tcx> Deref for SymValue<'tcx> {
+    type Target = SymValueI<'tcx>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Clone, Copy)]
 struct LoanId(usize);
@@ -58,12 +95,22 @@ fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> Sy
         SymValueI::Symbolic(_, id) if *id == ix => val,
         SymValueI::Symbolic(_, _) => this,
         SymValueI::Loan(_) => this,
-        SymValueI::Borrow(m, id, v) => {
-          Rc::new(SymValueI::Borrow(*m, *id, replace_sym(*v, ix, val)))
-        },
-        SymValueI::Constructor { id, args, fields } => todo!(),
-        SymValueI::Tuple(_) => todo!(),
-        SymValueI::Bot => todo!(),
+        SymValueI::Borrow(m, id, v) => SymValue::borrow(*m, *id, replace_sym(v.clone(), ix, val)),
+        SymValueI::Constructor { id, args, fields } => {
+            let fields = fields
+                .iter()
+                .map(|f| replace_sym(f.clone(), ix, val.clone()))
+                .collect();
+            SymValue::constructor(*id, args, fields)
+        }
+        SymValueI::Tuple(fields) => {
+            let fields = fields
+                .iter()
+                .map(|f| replace_sym(f.clone(), ix, val.clone()))
+                .collect();
+            SymValue::tuple(fields)
+        }
+        SymValueI::Bot => this,
     }
 }
 
@@ -77,26 +124,30 @@ impl<'tcx> SymState<'tcx> {
     fn fresh_sym(&mut self, ty: Ty<'tcx>) -> SymValue<'tcx> {
         let id = self.fresh_sym;
         self.fresh_sym += 1;
-        Rc::new(SymValueI::Symbolic(ty, id))
+        SymValue::symbolic(ty, id)
     }
 
     /// Unfold a symbolic value and fully replace it everywhere in the symbolic environment.
-    fn unfold(&mut self, id: usize, ty: Ty<'tcx>, variant: Option<VariantIdx>) {
+    fn unfold(
+        &mut self,
+        id: usize,
+        ty: Ty<'tcx>,
+        variant: Option<VariantIdx>,
+    ) -> Option<SymValue<'tcx>> {
         let new_val = match ty.kind() {
-            TyKind::Bool => return,
-            TyKind::Char => return,
-            TyKind::Int(_) => return,
-            TyKind::Uint(_) => return,
-            TyKind::Float(_) => return,
-            TyKind::Str => return,
-            TyKind::Ref(_, ty, mutbl) => Rc::new(SymValueI::Borrow(
-                *mutbl,
-                self.fresh_loan(),
-                self.fresh_sym(*ty),
-            )),
+            TyKind::Bool => return None,
+            TyKind::Char => return None,
+            TyKind::Int(_) => return None,
+            TyKind::Uint(_) => return None,
+            TyKind::Float(_) => return None,
+            TyKind::Str => return None,
+            TyKind::Ref(_, ty, mutbl) => {
+                SymValue::borrow(*mutbl, self.fresh_loan(), self.fresh_sym(*ty))
+            }
+
             TyKind::Tuple(fields) => {
                 let fields = fields.iter().map(|ty| self.fresh_sym(ty)).collect();
-                Rc::new(SymValueI::Tuple(fields))
+                SymValue::tuple(fields)
             }
 
             TyKind::Adt(adt, substs) => {
@@ -109,11 +160,7 @@ impl<'tcx> SymState<'tcx> {
                     .map(|field| self.fresh_sym(field.ty(self.tcx, substs)))
                     .collect();
 
-                Rc::new(SymValueI::Constructor {
-                    id: variant.def_id,
-                    args: substs,
-                    fields,
-                })
+                SymValue::constructor(variant.def_id, substs, fields)
             }
             TyKind::Slice(_) => self.tcx.dcx().fatal("not yet supported: slice"),
             TyKind::Foreign(_) => self.tcx.dcx().fatal("unsupported type"),
@@ -135,6 +182,14 @@ impl<'tcx> SymState<'tcx> {
             TyKind::Infer(_) => self.tcx.dcx().fatal("unsupported type"),
             TyKind::Error(_) => self.tcx.dcx().fatal("unsupported type"),
         };
+
+        // Replace the old value everywhere
+        self.env
+            .map
+            .values_mut()
+            .for_each(|val| *val = replace_sym(val.clone(), id, new_val.clone()));
+
+        Some(new_val)
     }
 
     fn project_value(
@@ -142,27 +197,60 @@ impl<'tcx> SymState<'tcx> {
         v: SymValue<'tcx>,
         proj: ProjectionElem<Local, Ty<'tcx>>,
     ) -> SymValue<'tcx> {
-        if let SymValueI::Symbolic(ty, id) = &*v {
+        let v = if let SymValueI::Symbolic(ty, id) = &*v {
             let var = if let ProjectionElem::Downcast(_, idx) = proj {
                 Some(idx)
             } else {
                 None
             };
-            self.unfold(*id, *ty, var);
-        }
+            self.unfold(*id, *ty, var).unwrap_or(v)
+        } else {
+            v
+        };
+
         match proj {
-            ProjectionElem::Deref => todo!(),
-            ProjectionElem::Field(_, _) => todo!(),
-            ProjectionElem::Index(_) => todo!(),
-            ProjectionElem::ConstantIndex {
-                offset,
-                min_length,
-                from_end,
-            } => todo!(),
-            ProjectionElem::Subslice { from, to, from_end } => todo!(),
-            ProjectionElem::Downcast(_, _) => todo!(),
-            ProjectionElem::OpaqueCast(_) => todo!(),
-            ProjectionElem::Subtype(_) => todo!(),
+            ProjectionElem::Deref => {
+                if let SymValueI::Borrow(_, _, pointed) = &*v {
+                    log::info!("dereferencing borrow value; suspicious");
+                    return pointed.clone();
+                } else {
+                    self.tcx.dcx().fatal("dereferenced non-borrow value")
+                }
+            }
+            ProjectionElem::Field(ix, _) => match &*v {
+                SymValueI::Constructor { fields, .. } | SymValueI::Tuple(fields) => {
+                    fields[ix.as_usize()].clone()
+                }
+                _ => self
+                    .tcx
+                    .dcx()
+                    .fatal("field projection on non-aggregate type"),
+            },
+            ProjectionElem::Index(_) => self.tcx.dcx().fatal("index, unsupported projection"),
+            ProjectionElem::ConstantIndex { .. } => self
+                .tcx
+                .dcx()
+                .fatal("constantindex, unsupported projection"),
+            ProjectionElem::Subslice { .. } => {
+                self.tcx.dcx().fatal("subslice, unsupported projection")
+            }
+            ProjectionElem::Downcast(_, ix) => match &*v {
+                SymValueI::Constructor { id, .. } => {
+                    let type_id = match self.tcx.def_kind(*id) {
+                        DefKind::Variant => self.tcx.parent(*id),
+                        _ => *id,
+                    };
+                    let adt = self.tcx.adt_def(type_id);
+
+                    assert_eq!(adt.variants()[ix].def_id, *id);
+                    v
+                }
+                _ => self.tcx.dcx().fatal("downcast, unsupported projection"),
+            },
+            ProjectionElem::OpaqueCast(_) => {
+                self.tcx.dcx().fatal("opaque cast, unsupported projection")
+            }
+            ProjectionElem::Subtype(_) => self.tcx.dcx().fatal("subtype, unsupported projection"),
         }
     }
 
@@ -173,18 +261,51 @@ impl<'tcx> SymState<'tcx> {
             .expect("expected environment to contain value");
 
         for proj in pl.projection {
-            base_val = base_val.project(proj);
+            base_val = self.project_value(base_val, proj);
         }
 
         base_val
     }
 
     fn eval_operand(&mut self, op: Operand<'tcx>) -> SymValue<'tcx> {
+        match op {
+            Operand::Copy(pl) => self.eval_place(pl),
+            Operand::Move(pl) => self.eval_place(pl),
+            Operand::Constant(c) => self.fresh_sym(c.ty()),
+        }
+    }
+
+    fn eval_rvalue(&mut self, r: Rvalue<'tcx>) -> SymValue<'tcx> {
+        todo!()
+    }
+
+    fn eval_assign(&mut self, lhs: Place<'tcx>, rhs: SymValue<'tcx>) {
         todo!()
     }
 
     fn eval_statement(&mut self, stmt: Statement<'tcx>) {
-        todo!()
+        match stmt.kind {
+            mir::StatementKind::Assign(asgn) => {
+                let rhs = self.eval_rvalue(asgn.1);
+                self.eval_assign(asgn.0, rhs)
+            }
+            mir::StatementKind::FakeRead(_) => {
+                log::info!("fake read; ignoring");
+            }
+            mir::StatementKind::SetDiscriminant {
+               ..
+            } => self.tcx.dcx().fatal("set discriminant; unsupported"),
+            mir::StatementKind::Deinit(_) => todo!(),
+            mir::StatementKind::StorageLive(_) => log::info!("storage live; ignoring"),
+            mir::StatementKind::StorageDead(_) => log::info!("storage dead; ignoring"),
+            mir::StatementKind::Retag(_, _) => log::info!("retag; ignoring"),
+            mir::StatementKind::PlaceMention(_) => log::info!("place mention; ignoring"),
+            mir::StatementKind::AscribeUserType(_, _) => log::info!("ascribe; ignoring"),
+            mir::StatementKind::Coverage(_) => log::info!("coverage; ignoring"),
+            mir::StatementKind::Intrinsic(_) => todo!(),
+            mir::StatementKind::ConstEvalCounter => log::info!("const eval counter; ignoring"),
+            mir::StatementKind::Nop => log::info!("nop; ignoring"),
+        }
     }
 
     fn eval_terminator(&mut self, term: Terminator<'tcx>) -> Vec<BasicBlock> {
