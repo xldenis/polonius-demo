@@ -36,8 +36,8 @@ extern crate rustc_trait_selection;
 extern crate rustc_type_ir;
 
 mod debug;
-
 mod aenealite;
+mod wto;
 
 thread_local! {
     pub static MIR_BODIES:
@@ -85,5 +85,6 @@ impl Callbacks for PoloniusDemo {
 fn run<'tcx>(tcx: TyCtxt<'tcx>) {
     for def_id in tcx.hir().body_owners() {
         debug::polonius_facts(tcx, def_id);
+        aenealite::run_analysis(tcx, def_id);
     }
 }

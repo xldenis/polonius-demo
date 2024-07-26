@@ -1,35 +1,159 @@
-use std::{collections::HashMap, ops::Deref, rc::Rc};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+    ops::Deref,
+    rc::Rc,
+};
 
+use petgraph::graphmap::DiGraphMap;
 use rustc_ast::Mutability;
+use rustc_borrowck::consumers::BodyWithBorrowckFacts;
+use rustc_data_structures::graph::Successors;
 use rustc_hir::{def::DefKind, def_id::DefId};
 use rustc_middle::{
     mir::{
-        self, BasicBlock, BorrowKind, Local, LocalDecls, Operand, Place, ProjectionElem, Rvalue,
-        Statement, Terminator,
+        self, tcx::PlaceTy, BasicBlock, Body, BorrowKind, Local, LocalDecls, Operand, Place,
+        ProjectionElem, Rvalue, Statement, Terminator, START_BLOCK,
     },
     ty::{GenericArgsRef, Ty, TyCtxt},
 };
+use rustc_span::{Span, Symbol};
 use rustc_target::abi::VariantIdx;
 use rustc_type_ir::TyKind;
 
+use std::hash::Hash;
+
+use crate::{
+    wto::{weak_topological_order, Component},
+    MIR_BODIES,
+};
+
+fn merge_hashmaps<K, V, F>(map1: &mut HashMap<K, V>, map2: &HashMap<K, V>, merge_fn: F)
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+    F: Fn(Option<&V>, Option<&V>) -> V,
+{
+    // Collect all unique keys from both maps
+    let all_keys: Vec<K> = map1
+        .keys()
+        .chain(map2.keys())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Apply merge function for each key
+    for key in all_keys {
+        let value1 = map1.get(&key);
+        let value2 = map2.get(&key);
+        let merged_value = merge_fn(value1, value2);
+        map1.insert(key, merged_value);
+    }
+}
+
 /// An experimental "lightweight" version of the Aeneas analysis which associates a symbolic value to each MIR place.
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum SymValueI<'tcx> {
     Symbolic(Ty<'tcx>, usize),
     Loan(LoanId),
     Borrow(Mutability, LoanId, SymValue<'tcx>),
-    Constructor { id: DefId, args: GenericArgsRef<'tcx>, fields: Vec<SymValue<'tcx>> },
+    Constructor {
+        nm: Symbol,
+        id: DefId,
+        args: GenericArgsRef<'tcx>,
+        fields: Vec<SymValue<'tcx>>,
+    },
     Tuple(Vec<SymValue<'tcx>>),
-    Bot(Ty<'tcx>),
+    /// We distinguish Box here since it has special behaviors
+    Box(SymValue<'tcx>),
+    /// Bottom in the lattice
+    Wild,
+    Uninit,
 }
 
-#[derive(Clone)]
+impl<'tcx> SymValue<'tcx> {
+    /// Returns true of this is anything other than bot, symbolic or a loan identifer
+    fn is_complex(&self) -> bool {
+        match &**self {
+            SymValueI::Symbolic(_, _) => false,
+            SymValueI::Loan(_) => false,
+            SymValueI::Uninit => false,
+            SymValueI::Wild => false,
+            _ => true,
+        }
+    }
+}
+impl Display for LoanId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoanId::Id(id) => write!(f, "{id}"),
+            LoanId::Wild => write!(f, "_"),
+        }
+    }
+}
+
+impl Display for SymValue<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match &**self {
+            SymValueI::Symbolic(_, id) => write!(f, "σ({id})"),
+            SymValueI::Loan(l) => write!(f, "loan({})", l),
+            SymValueI::Borrow(m, l, v) => {
+                let borrow = match m {
+                    Mutability::Not => "&",
+                    Mutability::Mut => "&mut",
+                };
+                write!(f, "{} loan({}) ", borrow, l)?;
+                if v.is_complex() {
+                    write!(f, "({v})")
+                } else {
+                    write!(f, "{v}")
+                }
+            }
+            SymValueI::Constructor { nm, fields, .. } => {
+                write!(f, "{nm} {{")?;
+
+                for field in fields {
+                    if field.is_complex() {
+                        write!(f, "({field}), ")?;
+                    } else {
+                        write!(f, "{field}, ")?;
+                    }
+                }
+                write!(f, "}}")
+            }
+            SymValueI::Box(b) => {
+                write!(f, "box ")?;
+                if b.is_complex() {
+                    write!(f, "({b})")
+                } else {
+                    write!(f, "{b}")
+                }
+            }
+            SymValueI::Tuple(fields) => {
+                write!(f, "(")?;
+                for field in fields {
+                    if field.is_complex() {
+                        write!(f, "({field}), ")?;
+                    } else {
+                        write!(f, "{field}, ")?;
+                    }
+                }
+                write!(f, ")")
+            }
+            SymValueI::Wild => write!(f, "_"),
+            SymValueI::Uninit => write!(f, "⊥"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct SymValue<'tcx>(Rc<SymValueI<'tcx>>);
 
 impl<'tcx> SymValue<'tcx> {
-    fn constructor(id: DefId, args: GenericArgsRef<'tcx>, fields: Vec<Self>) -> Self {
-        SymValue(Rc::new(SymValueI::Constructor { id, args, fields }))
+    fn constructor(nm: Symbol, id: DefId, args: GenericArgsRef<'tcx>, fields: Vec<Self>) -> Self {
+        SymValue(Rc::new(SymValueI::Constructor { nm, id, args, fields }))
     }
 
     fn borrow(m: Mutability, l: LoanId, v: Self) -> Self {
@@ -44,12 +168,70 @@ impl<'tcx> SymValue<'tcx> {
         SymValue(Rc::new(SymValueI::Tuple(fields)))
     }
 
-    fn bot(ty: Ty<'tcx>) -> Self {
-        SymValue(Rc::new(SymValueI::Bot(ty)))
+    fn bot() -> Self {
+        SymValue(Rc::new(SymValueI::Uninit))
+    }
+
+    fn wild() -> Self {
+        SymValue(Rc::new(SymValueI::Wild))
+    }
+
+    fn box_(inner: Self) -> Self {
+        SymValue(Rc::new(SymValueI::Box(inner)))
     }
 
     fn symbolic(ty: Ty<'tcx>, id: usize) -> Self {
         SymValue(Rc::new(SymValueI::Symbolic(ty, id)))
+    }
+
+    // TODO: Fix this to be able to create new symbolic values / wild / bottom on the fly
+    /// A naive, lossy-join between symbolic values.
+    fn join(&self, o: &Self) -> Self {
+        use SymValueI::*;
+
+        match (&*self.0, &*o.0) {
+            // If both are the same, return either
+            (_, _) if Rc::ptr_eq(&self.0, &o.0) => self.clone(),
+
+            // Join of anything with Bot is itself
+            (_, Wild) => self.clone(),
+            (Wild, _) => o.clone(),
+
+            // Symbolic values are joined to themselves
+            (Symbolic(ty1, id1), Symbolic(ty2, id2)) if ty1 == ty2 && id1 == id2 => self.clone(),
+            (Symbolic(ty, id), b) => {
+                todo!("unfold symbolic here")
+            }
+            // Loans are joined to themselves
+            (Loan(id1), Loan(id2)) if id1 == id2 => self.clone(),
+
+            // Join borrows if they have the same mutability and loan id
+            (Borrow(m1, l1, v1), Borrow(m2, l2, v2)) if m1 == m2 => {
+                let l = if l1 == l2 { *l1 } else { LoanId::Wild };
+                SymValue::borrow(*m1, *l1, v1.join(v2))
+            }
+
+            // Join constructors if they have the same name, id, and args
+            (
+                Constructor { nm: n1, id: i1, args: a1, fields: f1 },
+                Constructor { nm: n2, id: i2, args: a2, fields: f2 },
+            ) if n1 == n2 && i1 == i2 && a1 == a2 => {
+                let joined_fields = f1.iter().zip(f2.iter()).map(|(f1, f2)| f1.join(f2)).collect();
+                SymValue::constructor(*n1, *i1, *a1, joined_fields)
+            }
+
+            // Join tuples if they have the same length
+            (Tuple(t1), Tuple(t2)) if t1.len() == t2.len() => {
+                let joined_fields = t1.iter().zip(t2.iter()).map(|(f1, f2)| f1.join(f2)).collect();
+                SymValue::tuple(joined_fields)
+            }
+
+            // Join boxes by joining their contents
+            (Box(b1), Box(b2)) => SymValue::box_(b1.join(b2)),
+
+            // If no other case matches, return Bot as a fallback
+            _ => SymValue::wild(),
+        }
     }
 }
 
@@ -61,16 +243,25 @@ impl<'tcx> Deref for SymValue<'tcx> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct LoanId(usize);
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LoanId {
+    Id(usize),
+    Wild,
+}
 
+#[derive(Clone, PartialEq)]
 struct Environ<'tcx> {
     map: HashMap<Local, SymValue<'tcx>>,
 }
 
 impl<'tcx> Environ<'tcx> {
     fn join(&mut self, other: &Self) {
-        todo!("perform a pointwise join")
+        merge_hashmaps(&mut self.map, &other.map, |a, b| match (a, b) {
+            (None, Some(a)) => a.clone(),
+            (Some(a), None) => a.clone(),
+            (None, None) => SymValue::wild(),
+            (Some(a), Some(b)) => a.join(b),
+        });
     }
 
     fn get(&self, l: Local) -> Option<SymValue<'tcx>> {
@@ -78,12 +269,24 @@ impl<'tcx> Environ<'tcx> {
     }
 }
 
-struct SymState<'tcx> {
+impl Display for Environ<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{")?;
+        for (k, v) in &self.map {
+            write!(f, "{:?}: {}, ", k, v)?;
+        }
+        write!(f, "}}")
+    }
+}
+
+struct SymState<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     env: Environ<'tcx>,
     fresh_loan: usize,
     fresh_sym: usize,
-    locals: LocalDecls<'tcx>,
+    locals: &'a LocalDecls<'tcx>,
+    body: &'a Body<'tcx>,
+    blocks: HashMap<BasicBlock, Environ<'tcx>>,
 }
 
 fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> SymValue<'tcx> {
@@ -92,21 +295,23 @@ fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> Sy
         SymValueI::Symbolic(_, _) => this,
         SymValueI::Loan(_) => this,
         SymValueI::Borrow(m, id, v) => SymValue::borrow(*m, *id, replace_sym(v.clone(), ix, val)),
-        SymValueI::Constructor { id, args, fields } => {
+        SymValueI::Constructor { id, args, fields, nm } => {
             let fields = fields.iter().map(|f| replace_sym(f.clone(), ix, val.clone())).collect();
-            SymValue::constructor(*id, args, fields)
+            SymValue::constructor(*nm, *id, args, fields)
         }
         SymValueI::Tuple(fields) => {
             let fields = fields.iter().map(|f| replace_sym(f.clone(), ix, val.clone())).collect();
             SymValue::tuple(fields)
         }
-        SymValueI::Bot(_) => this,
+        SymValueI::Uninit => this,
+        SymValueI::Wild => this,
+        SymValueI::Box(inner) => SymValue::box_(replace_sym(inner.clone(), ix, val)),
     }
 }
 
-impl<'tcx> SymState<'tcx> {
+impl<'a, 'tcx> SymState<'a, 'tcx> {
     fn fresh_loan(&mut self) -> LoanId {
-        let l = LoanId(self.fresh_loan);
+        let l = LoanId::Id(self.fresh_loan);
         self.fresh_loan += 1;
         l
     }
@@ -144,13 +349,18 @@ impl<'tcx> SymState<'tcx> {
                 assert!(adt.variants().len() == 1 || variant.is_some());
 
                 let variant = &adt.variants()[variant.unwrap_or(0u32.into())];
-                let fields = variant
+                let fields: Vec<_> = variant
                     .fields
                     .iter()
                     .map(|field| self.fresh_sym(field.ty(self.tcx, substs)))
                     .collect();
+                let nm = variant.ident(self.tcx).name;
 
-                SymValue::constructor(variant.def_id, substs, fields)
+                if adt.is_box() {
+                    SymValue::box_(self.fresh_sym(substs.type_at(0)))
+                } else {
+                    SymValue::constructor(nm, variant.def_id, substs, fields)
+                }
             }
             _ => self.tcx.dcx().fatal("unsupported type"),
         };
@@ -167,18 +377,18 @@ impl<'tcx> SymState<'tcx> {
     /// Produce an unfolded bottom for the given type
     fn unfold_bot(&mut self, ty: Ty<'tcx>, variant: Option<VariantIdx>) -> SymValue<'tcx> {
         let new_val = match ty.kind() {
-            TyKind::Bool => return SymValue::bot(ty),
-            TyKind::Char => return SymValue::bot(ty),
-            TyKind::Int(_) => return SymValue::bot(ty),
-            TyKind::Uint(_) => return SymValue::bot(ty),
-            TyKind::Float(_) => return SymValue::bot(ty),
-            TyKind::Str => return SymValue::bot(ty),
-            TyKind::Ref(_, ty, mutbl) => {
+            TyKind::Bool => return SymValue::bot(),
+            TyKind::Char => return SymValue::bot(),
+            TyKind::Int(_) => return SymValue::bot(),
+            TyKind::Uint(_) => return SymValue::bot(),
+            TyKind::Float(_) => return SymValue::bot(),
+            TyKind::Str => return SymValue::bot(),
+            TyKind::Ref(_, _, _) => {
                 self.tcx.dcx().fatal("cannot unfold a bottom value of reference type")
             }
 
             TyKind::Tuple(fields) => {
-                let fields = fields.iter().map(|ty| SymValue::bot(ty)).collect();
+                let fields = fields.iter().map(|_ty| SymValue::bot()).collect();
                 SymValue::tuple(fields)
             }
 
@@ -186,13 +396,41 @@ impl<'tcx> SymState<'tcx> {
                 assert!(adt.variants().len() == 1 || variant.is_some());
 
                 let variant = &adt.variants()[variant.unwrap_or(0u32.into())];
-                let fields = variant
-                    .fields
-                    .iter()
-                    .map(|ty| SymValue::bot(ty.ty(self.tcx, substs)))
-                    .collect();
+                let fields = variant.fields.iter().map(|_ty| SymValue::bot()).collect();
+                let nm = variant.ident(self.tcx).name;
+                SymValue::constructor(nm, variant.def_id, substs, fields)
+            }
+            _ => self.tcx.dcx().fatal("unsupported type"),
+        };
 
-                SymValue::constructor(variant.def_id, substs, fields)
+        new_val
+    }
+
+    /// Produce an unfolded bottom for the given type
+    fn unfold_wild(&mut self, ty: Ty<'tcx>, variant: Option<VariantIdx>) -> SymValue<'tcx> {
+        let new_val = match ty.kind() {
+            TyKind::Bool => return SymValue::wild(),
+            TyKind::Char => return SymValue::wild(),
+            TyKind::Int(_) => return SymValue::wild(),
+            TyKind::Uint(_) => return SymValue::wild(),
+            TyKind::Float(_) => return SymValue::wild(),
+            TyKind::Str => return SymValue::wild(),
+            TyKind::Ref(_, _, _) => {
+                self.tcx.dcx().fatal("cannot unfold a wildtom value of reference type")
+            }
+
+            TyKind::Tuple(fields) => {
+                let fields = fields.iter().map(|_ty| SymValue::wild()).collect();
+                SymValue::tuple(fields)
+            }
+
+            TyKind::Adt(adt, substs) => {
+                assert!(adt.variants().len() == 1 || variant.is_some());
+
+                let variant = &adt.variants()[variant.unwrap_or(0u32.into())];
+                let fields = variant.fields.iter().map(|_ty| SymValue::wild()).collect();
+                let nm = variant.ident(self.tcx).name;
+                SymValue::constructor(nm, variant.def_id, substs, fields)
             }
             _ => self.tcx.dcx().fatal("unsupported type"),
         };
@@ -204,6 +442,7 @@ impl<'tcx> SymState<'tcx> {
         &mut self,
         v: SymValue<'tcx>,
         proj: ProjectionElem<Local, Ty<'tcx>>,
+        span: Span,
     ) -> SymValue<'tcx> {
         let v = if let SymValueI::Symbolic(ty, id) = &*v {
             let var = if let ProjectionElem::Downcast(_, idx) = proj { Some(idx) } else { None };
@@ -217,8 +456,10 @@ impl<'tcx> SymState<'tcx> {
                 if let SymValueI::Borrow(_, _, pointed) = &*v {
                     log::info!("dereferencing borrow value; suspicious");
                     return pointed.clone();
+                } else if let SymValueI::Box(pointed) = &*v {
+                    return pointed.clone();
                 } else {
-                    self.tcx.dcx().fatal("dereferenced non-borrow value")
+                    self.tcx.dcx().span_fatal(span, format!("dereferenced non-pointer value: {v}"))
                 }
             }
             ProjectionElem::Field(ix, _) => match &*v {
@@ -257,47 +498,74 @@ impl<'tcx> SymState<'tcx> {
     fn update_value(
         &mut self,
         mut lhs: SymValue<'tcx>,
+        place_ty: PlaceTy<'tcx>,
         projs: &[ProjectionElem<Local, Ty<'tcx>>],
         rhs: SymValue<'tcx>,
+        span: Span,
     ) -> SymValue<'tcx> {
         if projs.is_empty() {
             return rhs;
         }
 
-        if let SymValueI::Bot(ty) = &*lhs {
+        if let SymValueI::Uninit = &*lhs {
             let var =
                 if let ProjectionElem::Downcast(_, idx) = projs[0] { Some(idx) } else { None };
 
-            lhs = self.unfold_bot(*ty, var);
+            lhs = self.unfold_bot(place_ty.ty, var);
         }
 
         let proj = projs[0];
+        if let SymValueI::Symbolic(ty, id) = &*lhs {
+            let var = if let ProjectionElem::Downcast(_, idx) = proj { Some(idx) } else { None };
+            lhs = self.unfold(*id, *ty, var).unwrap_or(lhs)
+        };
+
+        let place_ty = place_ty.projection_ty(self.tcx, proj);
         match proj {
             ProjectionElem::Deref => {
                 if let SymValueI::Borrow(m, l, pointed) = &*lhs {
                     return SymValue::borrow(
                         *m,
                         *l,
-                        self.update_value(pointed.clone(), &projs[1..], rhs),
+                        self.update_value(pointed.clone(), place_ty, &projs[1..], rhs, span),
                     );
+                }
+                if let SymValueI::Box(pointed) = &*lhs {
+                    return SymValue::box_(self.update_value(
+                        pointed.clone(),
+                        place_ty,
+                        &projs[1..],
+                        rhs,
+                        span,
+                    ));
                 } else {
-                    self.tcx.dcx().fatal("dereferenced non-borrow value")
+                    self.tcx.dcx().span_fatal(span, "updating deref of non-borrow value")
                 }
             }
             ProjectionElem::Field(ix, _) => match &*lhs {
-                SymValueI::Constructor { id, args, fields } => {
-                    let updated =
-                        self.update_value(fields[ix.as_usize()].clone(), &projs[1..], rhs);
+                SymValueI::Constructor { nm, id, args, fields } => {
+                    let updated = self.update_value(
+                        fields[ix.as_usize()].clone(),
+                        place_ty,
+                        &projs[1..],
+                        rhs,
+                        span,
+                    );
 
                     let mut fields = fields.clone();
 
                     fields[ix.as_usize()] = updated;
 
-                    SymValue::constructor(*id, args, fields)
+                    SymValue::constructor(*nm, *id, args, fields)
                 }
                 SymValueI::Tuple(fields) => {
-                    let updated =
-                        self.update_value(fields[ix.as_usize()].clone(), &projs[1..], rhs);
+                    let updated = self.update_value(
+                        fields[ix.as_usize()].clone(),
+                        place_ty,
+                        &projs[1..],
+                        rhs,
+                        span,
+                    );
 
                     let mut fields = fields.clone();
 
@@ -316,7 +584,7 @@ impl<'tcx> SymState<'tcx> {
                     let adt = self.tcx.adt_def(type_id);
 
                     assert_eq!(adt.variants()[ix].def_id, *id);
-                    self.update_value(lhs, &projs[1..], rhs)
+                    self.update_value(lhs, place_ty, &projs[1..], rhs, span)
                 }
                 _ => self.tcx.dcx().fatal("downcast, unsupported projection"),
             },
@@ -331,37 +599,40 @@ impl<'tcx> SymState<'tcx> {
         }
     }
 
-    fn write_place(&mut self, lhs: Place<'tcx>, rhs: SymValue<'tcx>) {
+    fn write_place(&mut self, lhs: Place<'tcx>, rhs: SymValue<'tcx>, span: Span) {
         let updated = self.update_value(
-            self.env.get(lhs.local).unwrap_or(SymValue::bot(self.locals[lhs.local].ty)),
+            self.env.get(lhs.local).unwrap_or(SymValue::bot()),
+            PlaceTy::from_ty(self.locals[lhs.local].ty),
             lhs.projection,
             rhs,
+            span,
         );
         self.env.map.insert(lhs.local, updated);
     }
 
-    fn eval_place(&mut self, pl: Place<'tcx>) -> SymValue<'tcx> {
+    fn eval_place(&mut self, pl: Place<'tcx>, span: Span) -> SymValue<'tcx> {
         let mut base_val = self.env.get(pl.local).expect("expected environment to contain value");
 
+        // eprintln!("eval place {pl:?}");
         for proj in pl.projection {
-            base_val = self.project_value(base_val, proj);
+            base_val = self.project_value(base_val, proj, span);
         }
 
         base_val
     }
 
-    fn eval_operand(&mut self, op: Operand<'tcx>) -> SymValue<'tcx> {
+    fn eval_operand(&mut self, op: &Operand<'tcx>) -> SymValue<'tcx> {
         match op {
             // TODO mark this as either move or not
-            Operand::Copy(pl) => self.eval_place(pl),
-            Operand::Move(pl) => self.eval_place(pl),
+            Operand::Copy(pl) => self.eval_place(*pl, op.span(self.locals)),
+            Operand::Move(pl) => self.eval_place(*pl, op.span(self.locals)),
             Operand::Constant(c) => self.fresh_sym(c.ty()),
         }
     }
 
-    fn eval_rvalue(&mut self, r: Rvalue<'tcx>) -> SymValue<'tcx> {
+    fn eval_rvalue(&mut self, r: &Rvalue<'tcx>, span: Span) -> SymValue<'tcx> {
         match r {
-            Rvalue::Use(op) => self.eval_operand(op),
+            Rvalue::Use(op) => self.eval_operand(&op),
             Rvalue::Ref(_, m, pl) => {
                 let m = match m {
                     BorrowKind::Shared => Mutability::Not,
@@ -369,18 +640,30 @@ impl<'tcx> SymState<'tcx> {
                     BorrowKind::Mut { .. } => Mutability::Mut,
                 };
                 let loan = self.fresh_loan();
-                self.write_place(pl, SymValue::loan(loan));
+                let borrowed = self.eval_place(*pl, span);
+                self.write_place(*pl, SymValue::loan(loan), span);
 
-                let pl = self.eval_place(pl);
-                SymValue::borrow(m, loan, pl)
+                SymValue::borrow(m, loan, borrowed)
             }
-            Rvalue::Discriminant(_) => todo!(),
-            Rvalue::Aggregate(_, _) => todo!(),
-            Rvalue::Cast(_, _, _) => self.fresh_sym(r.ty(&self.locals, self.tcx)),
-            Rvalue::BinaryOp(_, _) => self.fresh_sym(r.ty(&self.locals, self.tcx)),
-            Rvalue::CheckedBinaryOp(_, _) => self.fresh_sym(r.ty(&self.locals, self.tcx)),
-            Rvalue::NullaryOp(_, _) => self.fresh_sym(r.ty(&self.locals, self.tcx)),
-            Rvalue::UnaryOp(_, _) => self.fresh_sym(r.ty(&self.locals, self.tcx)),
+            Rvalue::Discriminant(pl) => self.fresh_sym(pl.ty(self.locals, self.tcx).ty),
+            Rvalue::Aggregate(k, fields) => {
+                let fields: Vec<_> = fields.iter().map(|f| self.eval_operand(f)).collect();
+                match &**k {
+                    mir::AggregateKind::Tuple => SymValue::tuple(fields),
+                    mir::AggregateKind::Adt(id, varix, substs, _, _) => {
+                        let var = &self.tcx.adt_def(id).variants()[*varix];
+                        let nm = var.ident(self.tcx).name;
+
+                        SymValue::constructor(nm, var.def_id, substs, fields)
+                    }
+                    _ => self.tcx.dcx().span_fatal(span, "unsupported aggregate"),
+                }
+            }
+            Rvalue::Cast(_, _, _) => self.fresh_sym(r.ty(self.locals, self.tcx)),
+            Rvalue::BinaryOp(_, _) => self.fresh_sym(r.ty(self.locals, self.tcx)),
+            Rvalue::CheckedBinaryOp(_, _) => self.fresh_sym(r.ty(self.locals, self.tcx)),
+            Rvalue::NullaryOp(_, _) => self.fresh_sym(r.ty(self.locals, self.tcx)),
+            Rvalue::UnaryOp(_, _) => self.fresh_sym(r.ty(self.locals, self.tcx)),
             Rvalue::ShallowInitBox(_, _) => self.tcx.dcx().fatal("shallow init box"),
             Rvalue::CopyForDeref(_) => self.tcx.dcx().fatal("copy for deref"),
             Rvalue::Repeat(_, _) => self.tcx.dcx().fatal(" repeat"),
@@ -390,11 +673,11 @@ impl<'tcx> SymState<'tcx> {
         }
     }
 
-    fn eval_statement(&mut self, stmt: Statement<'tcx>) {
-        match stmt.kind {
+    fn eval_statement(&mut self, stmt: &Statement<'tcx>) {
+        match &stmt.kind {
             mir::StatementKind::Assign(asgn) => {
-                let rhs = self.eval_rvalue(asgn.1);
-                self.write_place(asgn.0, rhs)
+                let rhs = self.eval_rvalue(&asgn.1, stmt.source_info.span);
+                self.write_place(asgn.0, rhs, stmt.source_info.span)
             }
             mir::StatementKind::FakeRead(_) => {
                 log::info!("fake read; ignoring");
@@ -415,9 +698,9 @@ impl<'tcx> SymState<'tcx> {
         }
     }
 
-    fn eval_terminator(&mut self, term: Terminator<'tcx>) -> Vec<BasicBlock> {
-        match term.kind {
-            mir::TerminatorKind::Goto { target } => vec![target],
+    fn eval_terminator(&mut self, term: &Terminator<'tcx>) -> Vec<BasicBlock> {
+        match &term.kind {
+            mir::TerminatorKind::Goto { target } => vec![*target],
             mir::TerminatorKind::SwitchInt { discr, targets } => {
                 let _ = self.eval_operand(discr);
 
@@ -427,28 +710,149 @@ impl<'tcx> SymState<'tcx> {
             mir::TerminatorKind::Unreachable => vec![],
             mir::TerminatorKind::Drop { target, .. } => {
                 log::info!("ignoring drop terminator...");
-                vec![target]
+                vec![*target]
             }
             mir::TerminatorKind::Call { func, args, destination, target, .. } => {
                 let _ = self.eval_operand(func);
 
                 let _ = args.iter().for_each(|op| {
-                    self.eval_operand(op.node.clone());
+                    self.eval_operand(&op.node);
                 });
 
-                let ret_val = self.fresh_sym(destination.ty(&self.locals, self.tcx).ty);
-                self.write_place(destination, ret_val);
+                let ret_val = self.fresh_sym(destination.ty(self.locals, self.tcx).ty);
+                self.write_place(*destination, ret_val, term.source_info.span);
 
                 vec![target.unwrap()]
             }
-            mir::TerminatorKind::FalseEdge { .. } => self.tcx.dcx().fatal("unhandled terminator"),
-            mir::TerminatorKind::Assert { .. } => self.tcx.dcx().fatal("unhandled terminator"),
-            mir::TerminatorKind::Yield { .. } => self.tcx.dcx().fatal("unhandled terminator"),
-            mir::TerminatorKind::UnwindResume => self.tcx.dcx().fatal("unhandled terminator"),
-            mir::TerminatorKind::UnwindTerminate(_) => self.tcx.dcx().fatal("unhandled terminator"),
+            mir::TerminatorKind::FalseEdge { real_target, imaginary_target } => {
+                vec![*real_target, *imaginary_target]
+            }
+            mir::TerminatorKind::Assert { .. } => {
+                self.tcx.dcx().fatal("unhandled terminator Assert")
+            }
+            mir::TerminatorKind::Yield { .. } => self.tcx.dcx().fatal("unhandled terminator Yield"),
+            mir::TerminatorKind::UnwindResume => {
+                self.tcx.dcx().fatal("unhandled terminator UnwindResume")
+            }
+            mir::TerminatorKind::UnwindTerminate(_) => {
+                self.tcx.dcx().fatal("unhandled terminator UnwindTerminate")
+            }
             mir::TerminatorKind::CoroutineDrop => self.tcx.dcx().fatal("unhandled terminator"),
-            mir::TerminatorKind::FalseUnwind { .. } => self.tcx.dcx().fatal("unhandled terminator"),
-            mir::TerminatorKind::InlineAsm { .. } => self.tcx.dcx().fatal("unhandled terminator"),
+            mir::TerminatorKind::FalseUnwind { real_target, .. } => {
+                log::info!("skipping unwind of false unwind");
+                vec![*real_target]
+            }
+            mir::TerminatorKind::InlineAsm { .. } => {
+                self.tcx.dcx().fatal("unhandled terminator InlineAsm")
+            }
         }
     }
+
+    fn eval_block(&mut self, b: BasicBlock) -> Vec<BasicBlock> {
+        // eprintln!("{}", self.env);
+        for s in &self.body[b].statements {
+            // eprintln!("{:?}", s);
+            self.eval_statement(s);
+            // eprintln!("{}", self.env);
+        }
+
+        let res = self.eval_terminator(self.body[b].terminator());
+        // eprintln!("{:?}", self.body[b].terminator().kind);
+        // eprintln!("{}", self.env);
+        res
+    }
+
+    fn eval_body(&mut self) {
+        for a in self.body.args_iter() {
+            let fresh = self.fresh_sym(self.locals[a].ty);
+            self.env.map.insert(a, fresh);
+        }
+        self.blocks.insert(START_BLOCK, self.env.clone());
+
+        let graph = node_graph(self.body);
+        let wto = weak_topological_order(&graph, START_BLOCK);
+
+        for c in wto {
+            self.eval_component(&c)
+        }
+    }
+
+    fn eval_component(&mut self, component: &Component<BasicBlock>) {
+        match component {
+            Component::Vertex(bb) => {
+                let dests = self.eval_block(*bb);
+                for d in dests {
+                    self.blocks
+                        .entry(d)
+                        .and_modify(|env| env.join(&self.env))
+                        .or_insert_with(|| self.env.clone());
+                }
+            }
+            Component::Component(h, body) => {
+                let mut old = self.blocks.get(&h).cloned().unwrap();
+                let mut num_iter = 0;
+                while num_iter < 2 {
+                    eprintln!("executing {h:?} {{ {body:?} }}");
+                    self.eval_block(*h);
+
+                    for b in body {
+                        self.eval_component(b);
+                    }
+
+                    let new = self.blocks.get(&h);
+                    let new = &**new.as_ref().unwrap();
+                    eprintln!("{old}");
+                    eprintln!("{new}");
+                    if new != &old {
+                        old = new.clone();
+                        num_iter += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn node_graph(x: &Body) -> petgraph::graphmap::DiGraphMap<BasicBlock, ()> {
+    let mut graph = DiGraphMap::default();
+    for (bb, _) in x.basic_blocks.iter_enumerated() {
+        if x.basic_blocks[bb].is_cleanup {
+            continue;
+        }
+        graph.add_node(bb);
+        for tgt in x.basic_blocks.successors(bb) {
+            if x.basic_blocks[tgt].is_cleanup {
+                continue;
+            }
+            graph.add_edge(bb, tgt, ());
+        }
+    }
+
+    graph
+}
+
+pub(crate) fn run_analysis<'tcx>(tcx: TyCtxt<'tcx>, def_id: rustc_hir::def_id::LocalDefId) {
+    let a: &BodyWithBorrowckFacts<'tcx> = MIR_BODIES
+        .with(|state| {
+            let map = state.borrow_mut();
+            // SAFETY: For soundness we need to ensure that the bodies have
+            // the same lifetime (`'tcx`), which they had before they were
+            // stored in the thread local.
+            map.get(&def_id).map(|body| unsafe { std::mem::transmute(body) })
+        })
+        .expect("expected to find body");
+    let body = &a.body;
+    let mut state = SymState {
+        tcx,
+        env: Environ { map: Default::default() },
+        fresh_loan: 0,
+        fresh_sym: 0,
+        locals: &body.local_decls,
+        body: &body,
+        blocks: Default::default(),
+    };
+
+    state.eval_body();
 }

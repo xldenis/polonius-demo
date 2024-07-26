@@ -86,20 +86,19 @@ pub fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
     //     def_id,
     //     rustc_borrowck::consumers::ConsumerOptions::PoloniusOutputFacts,
     // );
-    let a: BodyWithBorrowckFacts = MIR_BODIES
+    let a: &BodyWithBorrowckFacts<'tcx> = MIR_BODIES
         .with(|state| {
-            let mut map = state.borrow_mut();
+            let map = state.borrow_mut();
             // SAFETY: For soundness we need to ensure that the bodies have
             // the same lifetime (`'tcx`), which they had before they were
             // stored in the thread local.
-            map.remove(&def_id)
-                .map(|body| unsafe { std::mem::transmute(body) })
+            map.get(&def_id).map(|body| unsafe { std::mem::transmute(body) })
         })
         .expect("expected to find body");
 
-    let reg_ctx = a.region_inference_context;
-    let location_table = a.location_table.unwrap();
-    let input_facts = a.input_facts.unwrap();
+    let reg_ctx = &a.region_inference_context;
+    let location_table = &a.location_table.as_ref().unwrap();
+    let input_facts = &a.input_facts.as_ref().unwrap();
 
     // Choose a representative for each region cycle
     let mut scc_repr: HashMap<u32, _> = HashMap::new();
@@ -124,11 +123,8 @@ pub fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
     }
     eprintln!("");
 
-    let base: HashMap<_, _> = input_facts
-        .subset_base
-        .iter()
-        .map(|(src, tgt, _)| (src, tgt))
-        .collect();
+    let base: HashMap<_, _> =
+        input_facts.subset_base.iter().map(|(src, tgt, _)| (src, tgt)).collect();
     // eprintln!("{:?}", input_facts.subset_base);
     // eprintln!("{:?}", output_facts);
     // eprintln!("{:?}", input_facts.subset_base);
