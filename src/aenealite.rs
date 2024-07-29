@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::HashMap,
     fmt::{Display, Formatter},
     ops::Deref,
@@ -15,7 +16,7 @@ use rustc_middle::{
         self, tcx::PlaceTy, BasicBlock, Body, BorrowKind, Local, LocalDecls, Operand, Place,
         ProjectionElem, Rvalue, Statement, Terminator, START_BLOCK,
     },
-    ty::{GenericArgsRef, Ty, TyCtxt},
+    ty::{GenericArgsRef, List, Ty, TyCtxt},
 };
 use rustc_span::{Span, Symbol};
 use rustc_target::abi::VariantIdx;
@@ -28,11 +29,11 @@ use crate::{
     MIR_BODIES,
 };
 
-fn merge_hashmaps<K, V, F>(map1: &mut HashMap<K, V>, map2: &HashMap<K, V>, merge_fn: F)
+fn merge_hashmaps<K, V, F>(map1: &mut HashMap<K, V>, map2: &HashMap<K, V>, mut merge_fn: F)
 where
     K: Eq + Hash + Clone,
     V: Clone,
-    F: Fn(Option<&V>, Option<&V>) -> V,
+    F: FnMut(Option<&V>, Option<&V>) -> V,
 {
     // Collect all unique keys from both maps
     let all_keys: Vec<K> = map1
@@ -68,8 +69,9 @@ enum SymValueI<'tcx> {
     Tuple(Vec<SymValue<'tcx>>),
     /// We distinguish Box here since it has special behaviors
     Box(SymValue<'tcx>),
-    /// Bottom in the lattice
+    /// Top in the lattice
     Wild,
+    /// Bot in the lattice?
     Uninit,
 }
 
@@ -184,53 +186,31 @@ impl<'tcx> SymValue<'tcx> {
         SymValue(Rc::new(SymValueI::Symbolic(ty, id)))
     }
 
-    // TODO: Fix this to be able to create new symbolic values / wild / bottom on the fly
-    /// A naive, lossy-join between symbolic values.
-    fn join(&self, o: &Self) -> Self {
-        use SymValueI::*;
+    fn is_uninit(&self) -> bool {
+        matches!(&*self.0, SymValueI::Uninit)
+    }
 
-        match (&*self.0, &*o.0) {
-            // If both are the same, return either
-            (_, _) if Rc::ptr_eq(&self.0, &o.0) => self.clone(),
+    fn fold(&self) -> Self {
+        match &*self.0 {
+            SymValueI::Symbolic(_, _) => self.clone(),
+            SymValueI::Loan(_) => self.clone(),
+            SymValueI::Borrow(_, _, _) => self.clone(),
+            SymValueI::Constructor { nm, id, args, fields } => {
+                let fields = fields.iter().map(|f| f.fold()).collect();
 
-            // Join of anything with Bot is itself
-            (_, Wild) => self.clone(),
-            (Wild, _) => o.clone(),
-
-            // Symbolic values are joined to themselves
-            (Symbolic(ty1, id1), Symbolic(ty2, id2)) if ty1 == ty2 && id1 == id2 => self.clone(),
-            (Symbolic(ty, id), b) => {
-                todo!("unfold symbolic here")
+                SymValue::constructor(*nm, *id, args, fields)
             }
-            // Loans are joined to themselves
-            (Loan(id1), Loan(id2)) if id1 == id2 => self.clone(),
-
-            // Join borrows if they have the same mutability and loan id
-            (Borrow(m1, l1, v1), Borrow(m2, l2, v2)) if m1 == m2 => {
-                let l = if l1 == l2 { *l1 } else { LoanId::Wild };
-                SymValue::borrow(*m1, *l1, v1.join(v2))
+            SymValueI::Tuple(flds) => {
+                let flds: Vec<_> = flds.iter().map(|f| f.fold()).collect();
+                if flds.iter().all(SymValue::is_uninit) {
+                    SymValue::bot()
+                } else {
+                    SymValue::tuple(flds)
+                }
             }
-
-            // Join constructors if they have the same name, id, and args
-            (
-                Constructor { nm: n1, id: i1, args: a1, fields: f1 },
-                Constructor { nm: n2, id: i2, args: a2, fields: f2 },
-            ) if n1 == n2 && i1 == i2 && a1 == a2 => {
-                let joined_fields = f1.iter().zip(f2.iter()).map(|(f1, f2)| f1.join(f2)).collect();
-                SymValue::constructor(*n1, *i1, *a1, joined_fields)
-            }
-
-            // Join tuples if they have the same length
-            (Tuple(t1), Tuple(t2)) if t1.len() == t2.len() => {
-                let joined_fields = t1.iter().zip(t2.iter()).map(|(f1, f2)| f1.join(f2)).collect();
-                SymValue::tuple(joined_fields)
-            }
-
-            // Join boxes by joining their contents
-            (Box(b1), Box(b2)) => SymValue::box_(b1.join(b2)),
-
-            // If no other case matches, return Bot as a fallback
-            _ => SymValue::wild(),
+            SymValueI::Box(b) => SymValue::box_(b.fold()),
+            SymValueI::Wild => self.clone(),
+            SymValueI::Uninit => self.clone(),
         }
     }
 }
@@ -255,15 +235,6 @@ struct Environ<'tcx> {
 }
 
 impl<'tcx> Environ<'tcx> {
-    fn join(&mut self, other: &Self) {
-        merge_hashmaps(&mut self.map, &other.map, |a, b| match (a, b) {
-            (None, Some(a)) => a.clone(),
-            (Some(a), None) => a.clone(),
-            (None, None) => SymValue::wild(),
-            (Some(a), Some(b)) => a.join(b),
-        });
-    }
-
     fn get(&self, l: Local) -> Option<SymValue<'tcx>> {
         self.map.get(&l).cloned()
     }
@@ -282,11 +253,10 @@ impl Display for Environ<'_> {
 struct SymState<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     env: Environ<'tcx>,
-    fresh_loan: usize,
-    fresh_sym: usize,
+    fresh_loan: Cell<usize>,
+    fresh_sym: Cell<usize>,
     locals: &'a LocalDecls<'tcx>,
     body: &'a Body<'tcx>,
-    blocks: HashMap<BasicBlock, Environ<'tcx>>,
 }
 
 fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> SymValue<'tcx> {
@@ -309,26 +279,91 @@ fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> Sy
     }
 }
 
+fn fresh_sym<'tcx>(fresh_sym: &Cell<usize>, ty: Ty<'tcx>) -> SymValue<'tcx> {
+    let id = fresh_sym.get();
+    fresh_sym.set(id + 1);
+    SymValue::symbolic(ty, id)
+}
+
 impl<'a, 'tcx> SymState<'a, 'tcx> {
-    fn fresh_loan(&mut self) -> LoanId {
-        let l = LoanId::Id(self.fresh_loan);
-        self.fresh_loan += 1;
+    fn fresh_loan(&self) -> LoanId {
+        let loan = self.fresh_loan.get();
+        let l = LoanId::Id(loan);
+        self.fresh_loan.set(loan + 1);
         l
     }
 
-    fn fresh_sym(&mut self, ty: Ty<'tcx>) -> SymValue<'tcx> {
-        let id = self.fresh_sym;
-        self.fresh_sym += 1;
-        SymValue::symbolic(ty, id)
+    fn fresh_sym(&self, ty: Ty<'tcx>) -> SymValue<'tcx> {
+        fresh_sym(&self.fresh_sym, ty)
+    }
+
+    // TODO: Fix this to be able to create new symbolic values / wild / bottom on the fly
+    /// A naive, lossy-join between symbolic values.
+    fn join_vals(&self, left: &SymValue<'tcx>, right: &SymValue<'tcx>) -> SymValue<'tcx> {
+        use SymValueI::*;
+
+        match (&*left.0, &*right.0) {
+            // If both are the same, return either
+            (_, _) if Rc::ptr_eq(&left.0, &right.0) => left.clone(),
+
+            (_, Uninit) => right.clone(),
+            (Uninit, _) => left.clone(),
+
+            (_, Wild) => right.clone(),
+            (Wild, _) => left.clone(),
+
+            // Symbolic values are joined to themselves
+            (Symbolic(ty1, id1), Symbolic(ty2, id2)) if ty1 == ty2 && id1 == id2 => left.clone(),
+            (Symbolic(ty, _), _) => {
+                let Some(left) = self.unfold(*ty, None) else { return SymValue::wild() };
+                self.join_vals(&left, right)
+            }
+            (_, Symbolic(_, _)) => self.join_vals(right, left),
+            // Loans are joined to themselves
+            (Loan(id1), Loan(id2)) if id1 == id2 => left.clone(),
+
+            // Join borrows if they have the same mutability and loan id
+            (Borrow(m1, l1, v1), Borrow(m2, l2, v2)) if m1 == m2 => {
+                let l = if l1 == l2 { *l1 } else { LoanId::Wild };
+                SymValue::borrow(*m1, l, self.join_vals(v1, v2))
+            }
+
+            // Join constructors if they have the same name, id, and args
+            (
+                Constructor { nm: n1, id: i1, args: a1, fields: f1 },
+                Constructor { nm: n2, id: i2, args: a2, fields: f2 },
+            ) if n1 == n2 && i1 == i2 && a1 == a2 => {
+                let joined_fields =
+                    f1.iter().zip(f2.iter()).map(|(f1, f2)| self.join_vals(f1, f2)).collect();
+                SymValue::constructor(*n1, *i1, *a1, joined_fields)
+            }
+
+            // Join tuples if they have the same length
+            (Tuple(t1), Tuple(t2)) if t1.len() == t2.len() => {
+                let joined_fields =
+                    t1.iter().zip(t2.iter()).map(|(f1, f2)| self.join_vals(f1, f2)).collect();
+                SymValue::tuple(joined_fields)
+            }
+
+            // Join boxes by joining their contents
+            (Box(b1), Box(b2)) => SymValue::box_(self.join_vals(b1, b2)),
+
+            // If no other case matches, return Bot as a fallback
+            _ => SymValue::wild(),
+        }
+    }
+
+    fn join_env(&self, left: &mut Environ<'tcx>, other: &Environ<'tcx>) {
+        merge_hashmaps(&mut left.map, &other.map, |a, b| match (a, b) {
+            (None, Some(a)) => a.clone(),
+            (Some(a), None) => a.clone(),
+            (None, None) => SymValue::wild(),
+            (Some(a), Some(b)) => self.join_vals(a, b),
+        });
     }
 
     /// Unfold a symbolic value and fully replace it everywhere in the symbolic environment.
-    fn unfold(
-        &mut self,
-        id: usize,
-        ty: Ty<'tcx>,
-        variant: Option<VariantIdx>,
-    ) -> Option<SymValue<'tcx>> {
+    fn unfold(&self, ty: Ty<'tcx>, variant: Option<VariantIdx>) -> Option<SymValue<'tcx>> {
         let new_val = match ty.kind() {
             TyKind::Bool => return None,
             TyKind::Char => return None,
@@ -346,7 +381,10 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             }
 
             TyKind::Adt(adt, substs) => {
-                assert!(adt.variants().len() == 1 || variant.is_some());
+                if adt.variants().len() > 1 && variant.is_none() {
+                    return None;
+                }
+                // assert!(adt.variants().len() == 1 || variant.is_some());
 
                 let variant = &adt.variants()[variant.unwrap_or(0u32.into())];
                 let fields: Vec<_> = variant
@@ -365,6 +403,17 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             _ => self.tcx.dcx().fatal("unsupported type"),
         };
 
+        Some(new_val)
+    }
+
+    /// Unfold a symbolic value and fully replace it everywhere in the symbolic environment.
+    fn unfold_and_subst(
+        &mut self,
+        id: usize,
+        ty: Ty<'tcx>,
+        variant: Option<VariantIdx>,
+    ) -> Option<SymValue<'tcx>> {
+        let new_val = self.unfold(ty, variant)?;
         // Replace the old value everywhere
         self.env
             .map
@@ -446,7 +495,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
     ) -> SymValue<'tcx> {
         let v = if let SymValueI::Symbolic(ty, id) = &*v {
             let var = if let ProjectionElem::Downcast(_, idx) = proj { Some(idx) } else { None };
-            self.unfold(*id, *ty, var).unwrap_or(v)
+            self.unfold_and_subst(*id, *ty, var).unwrap_or(v)
         } else {
             v
         };
@@ -517,7 +566,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
         let proj = projs[0];
         if let SymValueI::Symbolic(ty, id) = &*lhs {
             let var = if let ProjectionElem::Downcast(_, idx) = proj { Some(idx) } else { None };
-            lhs = self.unfold(*id, *ty, var).unwrap_or(lhs)
+            lhs = self.unfold_and_subst(*id, *ty, var).unwrap_or(lhs)
         };
 
         let place_ty = place_ty.projection_ty(self.tcx, proj);
@@ -607,7 +656,14 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             rhs,
             span,
         );
-        self.env.map.insert(lhs.local, updated);
+
+        let updated = updated.fold();
+
+        if let SymValueI::Uninit = &*updated {
+            self.env.map.remove(&lhs.local);
+        } else {
+            self.env.map.insert(lhs.local, updated);
+        }
     }
 
     fn eval_place(&mut self, pl: Place<'tcx>, span: Span) -> SymValue<'tcx> {
@@ -625,7 +681,11 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
         match op {
             // TODO mark this as either move or not
             Operand::Copy(pl) => self.eval_place(*pl, op.span(self.locals)),
-            Operand::Move(pl) => self.eval_place(*pl, op.span(self.locals)),
+            Operand::Move(pl) => {
+                let old_val = self.eval_place(*pl, op.span(self.locals));
+                self.write_place(*pl, SymValue::bot(), op.span(self.locals));
+                old_val
+            }
             Operand::Constant(c) => self.fresh_sym(c.ty()),
         }
     }
@@ -674,6 +734,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
     }
 
     fn eval_statement(&mut self, stmt: &Statement<'tcx>) {
+        let span = stmt.source_info.span;
         match &stmt.kind {
             mir::StatementKind::Assign(asgn) => {
                 let rhs = self.eval_rvalue(&asgn.1, stmt.source_info.span);
@@ -687,7 +748,11 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             }
             mir::StatementKind::Deinit(_) => todo!(),
             mir::StatementKind::StorageLive(_) => log::info!("storage live; ignoring"),
-            mir::StatementKind::StorageDead(_) => log::info!("storage dead; ignoring"),
+            mir::StatementKind::StorageDead(local) => self.write_place(
+                Place { local: *local, projection: &List::empty() },
+                SymValue::bot(),
+                span,
+            ),
             mir::StatementKind::Retag(_, _) => log::info!("retag; ignoring"),
             mir::StatementKind::PlaceMention(_) => log::info!("place mention; ignoring"),
             mir::StatementKind::AscribeUserType(_, _) => log::info!("ascribe; ignoring"),
@@ -727,8 +792,10 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             mir::TerminatorKind::FalseEdge { real_target, imaginary_target } => {
                 vec![*real_target, *imaginary_target]
             }
-            mir::TerminatorKind::Assert { .. } => {
-                self.tcx.dcx().fatal("unhandled terminator Assert")
+            mir::TerminatorKind::Assert { cond, target, .. } => {
+                let _ = self.eval_operand(cond);
+
+                vec![*target]
             }
             mir::TerminatorKind::Yield { .. } => self.tcx.dcx().fatal("unhandled terminator Yield"),
             mir::TerminatorKind::UnwindResume => {
@@ -762,44 +829,48 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
         res
     }
 
-    fn eval_body(&mut self) {
+    fn eval_body(&mut self, results: &mut HashMap<BasicBlock, Environ<'tcx>>) {
         for a in self.body.args_iter() {
             let fresh = self.fresh_sym(self.locals[a].ty);
             self.env.map.insert(a, fresh);
         }
-        self.blocks.insert(START_BLOCK, self.env.clone());
+        results.insert(START_BLOCK, self.env.clone());
 
         let graph = node_graph(self.body);
         let wto = weak_topological_order(&graph, START_BLOCK);
 
         for c in wto {
-            self.eval_component(&c)
+            self.eval_component(results, &c)
         }
     }
 
-    fn eval_component(&mut self, component: &Component<BasicBlock>) {
+    fn eval_component(
+        &mut self,
+        results: &mut HashMap<BasicBlock, Environ<'tcx>>,
+        component: &Component<BasicBlock>,
+    ) {
         match component {
             Component::Vertex(bb) => {
                 let dests = self.eval_block(*bb);
                 for d in dests {
-                    self.blocks
+                    results
                         .entry(d)
-                        .and_modify(|env| env.join(&self.env))
+                        .and_modify(|env| self.join_env(env, &self.env))
                         .or_insert_with(|| self.env.clone());
                 }
             }
             Component::Component(h, body) => {
-                let mut old = self.blocks.get(&h).cloned().unwrap();
+                let mut old = results.get(&h).cloned().unwrap();
                 let mut num_iter = 0;
                 while num_iter < 2 {
                     eprintln!("executing {h:?} {{ {body:?} }}");
                     self.eval_block(*h);
 
                     for b in body {
-                        self.eval_component(b);
+                        self.eval_component(results, b);
                     }
 
-                    let new = self.blocks.get(&h);
+                    let new = results.get(&h);
                     let new = &**new.as_ref().unwrap();
                     eprintln!("{old}");
                     eprintln!("{new}");
@@ -847,12 +918,13 @@ pub(crate) fn run_analysis<'tcx>(tcx: TyCtxt<'tcx>, def_id: rustc_hir::def_id::L
     let mut state = SymState {
         tcx,
         env: Environ { map: Default::default() },
-        fresh_loan: 0,
-        fresh_sym: 0,
+        fresh_loan: Cell::new(0),
+        fresh_sym: Cell::new(0),
         locals: &body.local_decls,
         body: &body,
-        blocks: Default::default(),
     };
 
-    state.eval_body();
+    let mut results = HashMap::new();
+
+    state.eval_body(&mut results);
 }

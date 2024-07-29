@@ -216,3 +216,6 @@ pub fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
         println!("");
     }
 }
+
+
+// fn fmt_stmt()

@@ -11,6 +11,18 @@
 //   *a = 5;
 //   x
 // }
+//
+//
+fn aeneas() {
+  let mut x = 0;
+  let mut p = &mut x;
+
+  loop {
+    p = &mut * p;
+    *p += 1;
+    continue
+  }
+}
 
 fn main() {
 
@@ -29,6 +41,6 @@ fn all_zero(mut x : &mut List) {
   }
 }
 
-fn swap<'a, 'b, T, U>(x : (&'a mut T, &'b mut U)) -> (&'b mut U, &'a mut T) {
-  (x.1, x.0)
-}
+// fn swap<'a, 'b, T, U>(x : (&'a mut T, &'b mut U)) -> (&'b mut U, &'a mut T) {
+//   (x.1, x.0)
+// }
