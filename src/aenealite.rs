@@ -71,7 +71,7 @@ enum SymValueI<'tcx> {
     Box(SymValue<'tcx>),
     /// Top in the lattice
     Wild,
-    /// Bot in the lattice?
+    /// Also top? in the lattice?
     Uninit,
 }
 
