@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
     ops::Deref,
     rc::Rc,
@@ -16,10 +16,10 @@ use rustc_middle::{
         self, tcx::PlaceTy, BasicBlock, Body, BorrowKind, Local, LocalDecls, Operand, Place,
         ProjectionElem, Rvalue, Statement, Terminator, START_BLOCK,
     },
-    ty::{GenericArgsRef, List, Ty, TyCtxt},
+    ty::{GenericArgsRef, List, Region, RegionVid, Ty, TyCtxt, TypeVisitor},
 };
 use rustc_span::{Span, Symbol};
-use rustc_target::abi::VariantIdx;
+use rustc_target::abi::{FieldIdx, VariantIdx};
 use rustc_type_ir::TyKind;
 
 use std::hash::Hash;
@@ -213,6 +213,36 @@ impl<'tcx> SymValue<'tcx> {
             SymValueI::Uninit => self.clone(),
         }
     }
+
+    /// Returns true if there is a substitution renaming loans and symbolic values between the two tools
+    fn weak_unification(&self, rhs: &Self, subst: &mut Substitution) -> bool {
+        match (&*self.0, &*rhs.0) {
+            (SymValueI::Symbolic(_, u), SymValueI::Symbolic(_, v)) => {
+                subst.syms.insert(*u, *v);
+                true
+            }
+            (SymValueI::Loan(l), SymValueI::Loan(k)) => {
+                subst.loans.insert(*l, *k);
+                true
+            }
+            (SymValueI::Borrow(_, l, f), SymValueI::Borrow(_, k, g)) => {
+                subst.loans.insert(*l, *k);
+                // unify l and k
+                f.weak_unification(g, subst)
+            }
+            (
+                SymValueI::Constructor { fields: fs, .. },
+                SymValueI::Constructor { fields: gs, .. },
+            ) => fs.iter().zip(gs).all(|(f, g)| f.weak_unification(g, subst)),
+            (SymValueI::Tuple(fs), SymValueI::Tuple(gs)) => {
+                fs.iter().zip(gs).all(|(f, g)| f.weak_unification(g, subst))
+            }
+            (SymValueI::Box(f), SymValueI::Box(g)) => f.weak_unification(g, subst),
+            (SymValueI::Wild, SymValueI::Wild) => true,
+            (SymValueI::Uninit, SymValueI::Uninit) => true,
+            _ => false,
+        }
+    }
 }
 
 impl<'tcx> Deref for SymValue<'tcx> {
@@ -223,10 +253,16 @@ impl<'tcx> Deref for SymValue<'tcx> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
 enum LoanId {
     Id(usize),
     Wild,
+}
+
+#[derive(Default)]
+struct Substitution {
+    loans: HashMap<LoanId, LoanId>,
+    syms: HashMap<usize, usize>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -237,6 +273,24 @@ struct Environ<'tcx> {
 impl<'tcx> Environ<'tcx> {
     fn get(&self, l: Local) -> Option<SymValue<'tcx>> {
         self.map.get(&l).cloned()
+    }
+
+    /// Returns true if there is a substitution renaming loans and symbolic values between the two tools
+    fn weak_unification(&self, rhs: &Self, subst: &mut Substitution) -> bool {
+        for (k, v) in &self.map {
+            let Some(v2) = rhs.get(*k) else {
+                eprintln!("missing key in rhs");
+                return false;
+            };
+
+            let res = v.weak_unification(&v2, subst);
+
+            if !res {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -315,16 +369,20 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             // Symbolic values are joined to themselves
             (Symbolic(ty1, id1), Symbolic(ty2, id2)) if ty1 == ty2 && id1 == id2 => left.clone(),
             (Symbolic(ty, _), _) => {
-                let Some(left) = self.unfold(*ty, None) else { return SymValue::wild() };
+                let Some(left) = self.unfold(*ty, None) else { return self.fresh_sym(*ty) };
                 self.join_vals(&left, right)
             }
             (_, Symbolic(_, _)) => self.join_vals(right, left),
             // Loans are joined to themselves
             (Loan(id1), Loan(id2)) if id1 == id2 => left.clone(),
+            (Loan(id1), Loan(id2)) => {
+                let l = if id1 == id2 { *id1 } else { LoanId::Wild };
+                SymValue(Rc::new(SymValueI::Loan(l)))
+            }
 
             // Join borrows if they have the same mutability and loan id
             (Borrow(m1, l1, v1), Borrow(m2, l2, v2)) if m1 == m2 => {
-                let l = if l1 == l2 { *l1 } else { LoanId::Wild };
+                let l = if l1 == l2 { *l1 } else { self.fresh_loan() };
                 SymValue::borrow(*m1, l, self.join_vals(v1, v2))
             }
 
@@ -349,7 +407,10 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             (Box(b1), Box(b2)) => SymValue::box_(self.join_vals(b1, b2)),
 
             // If no other case matches, return Bot as a fallback
-            _ => SymValue::wild(),
+            _ => {
+                eprintln!("{right} v {left}");
+                SymValue::wild()
+            }
         }
     }
 
@@ -851,6 +912,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
     ) {
         match component {
             Component::Vertex(bb) => {
+                // eprintln!("{bb:?} {}", results.get(bb).unwrap());
                 let dests = self.eval_block(*bb);
                 for d in dests {
                     results
@@ -862,8 +924,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             Component::Component(h, body) => {
                 let mut old = results.get(&h).cloned().unwrap();
                 let mut num_iter = 0;
-                while num_iter < 2 {
-                    eprintln!("executing {h:?} {{ {body:?} }}");
+                while num_iter < 3 {
                     self.eval_block(*h);
 
                     for b in body {
@@ -872,17 +933,160 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
 
                     let new = results.get(&h);
                     let new = &**new.as_ref().unwrap();
+                    let mut subst = Substitution::default();
+
+                    let unified = old.weak_unification(new, &mut subst);
                     eprintln!("{old}");
                     eprintln!("{new}");
-                    if new != &old {
+                    eprintln!("{unified}");
+                    if !unified {
                         old = new.clone();
                         num_iter += 1;
                     } else {
                         break;
                     }
                 }
+                self.invariants_between(&old, results.get(&h).unwrap());
             }
         }
+    }
+
+    /// Calculate the loop invariant given a state immediately before a loop and a state immediately afterwards.
+    fn invariants_between(&self, pre: &Environ<'tcx>, post: &Environ<'tcx>) {
+        let mut changed = HashMap::new();
+        let mut affected_lifetimes: HashMap<_, HashSet<_>> = HashMap::new();
+        for (k, v) in &pre.map {
+            if post.get(*k) != Some(v.clone()) {
+                changed.insert(k, v);
+
+                let rust_ty = self.body.local_decls[*k].ty;
+                let mut col = RegionCollector { regions: Default::default() };
+                col.visit_ty(rust_ty);
+
+                for lft in col.regions {
+                    affected_lifetimes.entry(lft).or_default().insert(*k);
+                }
+            }
+        }
+
+        eprintln!("needing magic wands {:?}", affected_lifetimes);
+
+        for (lft, vars) in affected_lifetimes {
+            let mut out = Vec::new();
+            for var in vars {
+                diff_terms(
+                    WandTerm::Var(var),
+                    &pre.get(var).unwrap(),
+                    &post.get(var).unwrap(),
+                    &mut out,
+                );
+            }
+            let (pres, posts) = out.into_iter().unzip();
+
+            let post = WandTerm::Conj(posts);
+            let pre = WandTerm::Conj(pres);
+            let wand = WandTerm::Wand(Box::new(post), Box::new(pre));
+            eprintln!("wand associated to {lft:?}: {wand}");
+        }
+    }
+}
+
+fn diff_terms<'tcx>(
+    base: WandTerm,
+    l: &SymValue<'tcx>,
+    r: &SymValue<'tcx>,
+    out: &mut Vec<(WandTerm, WandTerm)>,
+) {
+    if l == r {
+        return;
+    }
+
+    match (&**l, &**r) {
+        (SymValueI::Symbolic(_, _), SymValueI::Symbolic(_, _)) => {
+            out.push((WandTerm::Old(Box::new(base.clone())), base))
+        }
+        (SymValueI::Loan(_), SymValueI::Loan(_)) => todo!("loan?"),
+        (SymValueI::Borrow(_, _, l2), SymValueI::Borrow(_, _, r2)) => {
+            diff_terms(WandTerm::Deref(Box::new(base)), l2, r2, out)
+        }
+        (SymValueI::Constructor { .. }, SymValueI::Constructor { .. }) => todo!(),
+        (SymValueI::Tuple(fs), SymValueI::Tuple(gs)) => {
+            for (ix, (f, g)) in fs.iter().zip(gs).enumerate() {
+                if f == g {
+                    continue;
+                }
+
+                let base = WandTerm::Field(Box::new(base.clone()), ix.into());
+                diff_terms(base, f, g, out)
+            }
+        }
+        (SymValueI::Box(l2), SymValueI::Box(r2)) => {
+            diff_terms(WandTerm::Deref(Box::new(base)), l2, r2, out)
+        }
+        (SymValueI::Wild, SymValueI::Wild) => (),
+        (SymValueI::Uninit, SymValueI::Uninit) => (),
+        _ => todo!("differing left and rightss"),
+    }
+}
+
+/// Hrm... should this actually have Place instead? It seems counter productive to do sym value
+/// Lets start with a `symvalue ` here even if that's counterproductive in the long term
+#[derive(Debug, Clone)]
+enum WandTerm {
+    Old(Box<WandTerm>),
+    Var(Local),
+    Deref(Box<WandTerm>),
+    Downcast(Box<WandTerm>, VariantIdx, Option<Symbol>),
+    Field(Box<WandTerm>, FieldIdx),
+    // Tuple(Vec<WandTerm>),
+    Conj(Vec<WandTerm>),
+    Wand(Box<WandTerm>, Box<WandTerm>),
+}
+
+impl<'tcx> std::fmt::Display for WandTerm {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WandTerm::Conj(ss) => {
+                write!(f, "{}", ss[0])?;
+
+                for s in &ss[1..] {
+                    write!(f, "/\\ {s}")?;
+                }
+
+                Ok(())
+            }
+            WandTerm::Wand(l, r) => {
+                write!(f, "{l} -* {r}")
+            }
+            WandTerm::Old(w) => write!(f, "old({w})"),
+            WandTerm::Var(l) => write!(f, "{l:?}"),
+            WandTerm::Deref(w) => write!(f, "* {w}"),
+            // WandTerm::Borrow(_, _, _) => todo!(),
+            WandTerm::Downcast(w, _ix, sym) => {
+                write!(f, "{w}")?;
+                if let Some(sym) = sym {
+                    write!(f, " as {sym}")?
+                };
+                Ok(())
+            }
+            WandTerm::Field(w, ix) => write!(f, "{w} . {}", ix.as_usize()),
+            // WandTerm::Box(w) => ,
+        }
+    }
+}
+
+struct RegionCollector {
+    regions: HashSet<RegionVid>,
+}
+
+impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for RegionCollector {
+    fn visit_region(&mut self, _r: Region<'tcx>) -> Self::Result {
+        match _r.kind() {
+            rustc_type_ir::RegionKind::ReVar(revar) => self.regions.insert(revar),
+
+            _ => todo!("unsupported region type"),
+        };
+        ()
     }
 }
 

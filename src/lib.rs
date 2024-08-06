@@ -4,14 +4,16 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
+use prustilite::encode_body;
 use rustc_borrowck::consumers::{BodyWithBorrowckFacts, ConsumerOptions};
-use rustc_hir::def_id::LocalDefId;
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_interface::Config;
 use rustc_middle::ty::TyCtxt;
 
 // #[macro_use]
 extern crate log;
 extern crate polonius_engine;
+extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_borrowck;
 extern crate rustc_data_structures;
@@ -35,8 +37,9 @@ extern crate rustc_target;
 extern crate rustc_trait_selection;
 extern crate rustc_type_ir;
 
-mod debug;
 mod aenealite;
+mod debug;
+mod prustilite;
 mod wto;
 
 thread_local! {
@@ -82,9 +85,24 @@ impl Callbacks for PoloniusDemo {
     }
 }
 
+fn prustilite_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
+    let a: &BodyWithBorrowckFacts<'tcx> = MIR_BODIES
+        .with(|state| {
+            let map = state.borrow_mut();
+            // SAFETY: For soundness we need to ensure that the bodies have
+            // the same lifetime (`'tcx`), which they had before they were
+            // stored in the thread local.
+            map.get(&def_id).map(|body| unsafe { std::mem::transmute(body) })
+        })
+        .expect("expected to find body");
+    let body = &a.body;
+    encode_body(&mut std::io::stdout(), tcx, body).unwrap();
+}
+
 fn run<'tcx>(tcx: TyCtxt<'tcx>) {
     for def_id in tcx.hir().body_owners() {
-        debug::polonius_facts(tcx, def_id);
+        // debug::polonius_facts(tcx, def_id);
         aenealite::run_analysis(tcx, def_id);
+        prustilite_body(tcx, def_id);
     }
 }

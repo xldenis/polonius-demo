@@ -1,0 +1,84 @@
+// A manual encoding of "aeneas()" from demo.rs
+field i32 : Int
+
+field deref : Ref
+
+predicate I32(x: Ref) {
+  acc(x.i32) 
+}
+
+predicate Borrow_I32(x: Ref) {
+  acc(x.deref) && I32(x.deref)
+}
+
+method aeneas() {
+  // StorageLive(_x)
+  var x : Ref := new(i32);
+  // x = 0;
+  x.i32 := 0;
+  fold I32(x);
+  // StorageLive(_p)
+  var p : Ref := new(deref);
+  // fold Borrow_I32(p);
+  // p = &mut x
+  p.deref := x;
+  fold Borrow_I32(p);
+  
+  package Borrow_I32(p) --* Borrow_I32(old(p)) {};
+
+  while (true) 
+    invariant (Borrow_I32(p))
+    invariant (Borrow_I32(p) --* Borrow_I32(old(p)))
+  {
+    unfold Borrow_I32(p);
+    p.deref := p.deref;
+    unfold I32(p.deref);
+    p.deref.i32 := p.deref.i32 + 1;
+    fold I32(p.deref);
+    fold Borrow_I32(p);
+  }
+}
+
+method aeneas_prustilite() returns () {
+  label bb0;
+  var _1 : Ref := new(i32);
+  _1.i32:=0;
+  fold I32(_1);
+  var _2 : Ref := new(deref);
+
+  _2.deref:=_1;
+  fold Borrow_I32(_2);
+  goto bb1;
+  label bb1
+  invariant (Borrow_I32(_2));
+  goto bb2
+  label bb2;
+  var _6 : Ref := new(deref);
+  var _5 : Ref := new(deref);
+  unfold Borrow_I32(_2);
+  _6.deref:=_2.deref;
+  _5.deref:=_6.deref;
+  _2:=_5;
+  var _7 : Ref := new(i32);
+  unfold I32(_2.deref);
+  _7.i32 :=_2.deref.i32+1;
+  goto bb3
+  label bb3;
+  _2.deref.i32:=_7.i32;
+  fold I32(_2.deref);
+  fold Borrow_I32(_2);
+  goto bb1;
+}
+
+// fn aeneas() {
+//   let mut x = 0;
+//   let mut p = &mut x;
+
+//   loop {
+//     // invariant acc(p);
+//     // invariant acc(p) -* acc(p)
+//     p = &mut * p;
+//     *p += 1;
+//     continue
+//   }
+// 
