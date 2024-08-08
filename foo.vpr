@@ -1,0 +1,25 @@
+field elem: Int
+field next: Ref
+
+predicate list(this: Ref) {
+  acc(this.elem) && acc(this.next) &&
+  (this.next != null ==> list(this.next))
+}
+
+function listLength(l:Ref) : Int
+  requires list(l)
+  ensures  result > 0
+{ 
+  unfolding list(l) in l.next == null ? 1 : 1 + listLength(l.next) 
+}
+
+predicate list_non_empty(this: Ref) {
+    list(this) && listLength(this) > 1
+}
+
+method adsf (l: Ref) 
+    requires list(l)
+    requires listLength(l) > 1 {
+        unfold list(l);
+        assert l.next != null;
+    }

@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     fmt::{Display, Formatter},
     ops::Deref,
@@ -13,8 +13,7 @@ use rustc_data_structures::graph::Successors;
 use rustc_hir::{def::DefKind, def_id::DefId};
 use rustc_middle::{
     mir::{
-        self, tcx::PlaceTy, BasicBlock, Body, BorrowKind, Local, LocalDecls, Operand, Place,
-        ProjectionElem, Rvalue, Statement, Terminator, START_BLOCK,
+        self, tcx::PlaceTy, BasicBlock, Body, BorrowKind, Local, LocalDecls, Location, Operand, Place, ProjectionElem, Rvalue, Statement, Terminator, START_BLOCK
     },
     ty::{GenericArgsRef, List, Region, RegionVid, Ty, TyCtxt, TypeVisitor},
 };
@@ -304,13 +303,26 @@ impl Display for Environ<'_> {
     }
 }
 
+enum GhostAction<'tcx> {
+    Unfold(Ty<'tcx>),
+    Fold(Ty<'tcx>),
+}
+
 struct SymState<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     env: Environ<'tcx>,
+    ghost_actions: RefCell<Vec<GhostAction<'tcx>>>,
     fresh_loan: Cell<usize>,
     fresh_sym: Cell<usize>,
     locals: &'a LocalDecls<'tcx>,
     body: &'a Body<'tcx>,
+}
+
+#[derive(Default)]
+struct SymResults<'tcx> {
+    envs: HashMap<BasicBlock, Environ<'tcx>>,
+    // Ghost actions to take before executing the given location.
+    ghost_actions: HashMap<Location, Vec<GhostAction<'tcx>>>,
 }
 
 fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> SymValue<'tcx> {
@@ -464,6 +476,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             _ => self.tcx.dcx().fatal("unsupported type"),
         };
 
+        self.ghost_actions.borrow_mut().push(GhostAction::Unfold(ty));
         Some(new_val)
     }
 
@@ -507,38 +520,6 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
 
                 let variant = &adt.variants()[variant.unwrap_or(0u32.into())];
                 let fields = variant.fields.iter().map(|_ty| SymValue::bot()).collect();
-                let nm = variant.ident(self.tcx).name;
-                SymValue::constructor(nm, variant.def_id, substs, fields)
-            }
-            _ => self.tcx.dcx().fatal("unsupported type"),
-        };
-
-        new_val
-    }
-
-    /// Produce an unfolded bottom for the given type
-    fn unfold_wild(&mut self, ty: Ty<'tcx>, variant: Option<VariantIdx>) -> SymValue<'tcx> {
-        let new_val = match ty.kind() {
-            TyKind::Bool => return SymValue::wild(),
-            TyKind::Char => return SymValue::wild(),
-            TyKind::Int(_) => return SymValue::wild(),
-            TyKind::Uint(_) => return SymValue::wild(),
-            TyKind::Float(_) => return SymValue::wild(),
-            TyKind::Str => return SymValue::wild(),
-            TyKind::Ref(_, _, _) => {
-                self.tcx.dcx().fatal("cannot unfold a wildtom value of reference type")
-            }
-
-            TyKind::Tuple(fields) => {
-                let fields = fields.iter().map(|_ty| SymValue::wild()).collect();
-                SymValue::tuple(fields)
-            }
-
-            TyKind::Adt(adt, substs) => {
-                assert!(adt.variants().len() == 1 || variant.is_some());
-
-                let variant = &adt.variants()[variant.unwrap_or(0u32.into())];
-                let fields = variant.fields.iter().map(|_ty| SymValue::wild()).collect();
                 let nm = variant.ident(self.tcx).name;
                 SymValue::constructor(nm, variant.def_id, substs, fields)
             }
@@ -876,12 +857,10 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
         }
     }
 
-    fn eval_block(&mut self, b: BasicBlock) -> Vec<BasicBlock> {
-        // eprintln!("{}", self.env);
+    fn eval_block(&mut self, b: BasicBlock,results: &mut SymResults<'tcx>,) -> Vec<BasicBlock> {
         for s in &self.body[b].statements {
-            // eprintln!("{:?}", s);
             self.eval_statement(s);
-            // eprintln!("{}", self.env);
+            let _ = std::mem::take(&mut self.ghost_actions);
         }
 
         let res = self.eval_terminator(self.body[b].terminator());
@@ -890,12 +869,12 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
         res
     }
 
-    fn eval_body(&mut self, results: &mut HashMap<BasicBlock, Environ<'tcx>>) {
+    fn eval_body(&mut self, results: &mut SymResults<'tcx>) {
         for a in self.body.args_iter() {
             let fresh = self.fresh_sym(self.locals[a].ty);
             self.env.map.insert(a, fresh);
         }
-        results.insert(START_BLOCK, self.env.clone());
+        results.envs. insert(START_BLOCK, self.env.clone());
 
         let graph = node_graph(self.body);
         let wto = weak_topological_order(&graph, START_BLOCK);
@@ -907,31 +886,31 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
 
     fn eval_component(
         &mut self,
-        results: &mut HashMap<BasicBlock, Environ<'tcx>>,
+        results: &mut SymResults<'tcx>,
         component: &Component<BasicBlock>,
     ) {
         match component {
             Component::Vertex(bb) => {
                 // eprintln!("{bb:?} {}", results.get(bb).unwrap());
-                let dests = self.eval_block(*bb);
+                let dests = self.eval_block(*bb, results);
                 for d in dests {
-                    results
+                    results.envs
                         .entry(d)
                         .and_modify(|env| self.join_env(env, &self.env))
                         .or_insert_with(|| self.env.clone());
                 }
             }
             Component::Component(h, body) => {
-                let mut old = results.get(&h).cloned().unwrap();
+                let mut old = results.envs.get(&h).cloned().unwrap();
                 let mut num_iter = 0;
                 while num_iter < 3 {
-                    self.eval_block(*h);
+                    self.eval_block(*h, results);
 
                     for b in body {
                         self.eval_component(results, b);
                     }
 
-                    let new = results.get(&h);
+                    let new = results.envs.get(&h);
                     let new = &**new.as_ref().unwrap();
                     let mut subst = Substitution::default();
 
@@ -946,7 +925,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
                         break;
                     }
                 }
-                self.invariants_between(&old, results.get(&h).unwrap());
+                self.invariants_between(&old, results.envs.get(&h).unwrap());
             }
         }
     }
@@ -1126,9 +1105,10 @@ pub(crate) fn run_analysis<'tcx>(tcx: TyCtxt<'tcx>, def_id: rustc_hir::def_id::L
         fresh_sym: Cell::new(0),
         locals: &body.local_decls,
         body: &body,
+        ghost_actions: RefCell::new(Vec::new())
     };
 
-    let mut results = HashMap::new();
+    let mut results = SymResults::default();
 
     state.eval_body(&mut results);
 }
