@@ -13,7 +13,8 @@ use rustc_data_structures::graph::Successors;
 use rustc_hir::{def::DefKind, def_id::DefId};
 use rustc_middle::{
     mir::{
-        self, tcx::PlaceTy, BasicBlock, Body, BorrowKind, Local, LocalDecls, Location, Operand, Place, ProjectionElem, Rvalue, Statement, Terminator, START_BLOCK
+        self, tcx::PlaceTy, BasicBlock, Body, BorrowKind, Local, LocalDecls, Location, Operand,
+        Place, ProjectionElem, Rvalue, Statement, Terminator, START_BLOCK,
     },
     ty::{GenericArgsRef, List, Region, RegionVid, Ty, TyCtxt, TypeVisitor},
 };
@@ -52,10 +53,31 @@ where
     }
 }
 
+pub fn for_all_vars<'tcx, F: FnMut(Local, Option<SymValue<'tcx>>, Option<SymValue<'tcx>>)>(
+    pre: &Environ<'tcx>,
+    post: &Environ<'tcx>,
+    mut f: F,
+) {
+    let all_keys: Vec<_> = pre
+        .map
+        .keys()
+        .chain(post.map.keys())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    // Apply merge function for each key
+    for key in all_keys {
+        let value1 = pre.get(key);
+        let value2 = post.get(key);
+        f(key, value1, value2);
+    }
+}
+
 /// An experimental "lightweight" version of the Aeneas analysis which associates a symbolic value to each MIR place.
 
 #[derive(Clone, Debug, PartialEq)]
-enum SymValueI<'tcx> {
+pub enum SymValueI<'tcx> {
     Symbolic(Ty<'tcx>, usize),
     Loan(LoanId),
     Borrow(Mutability, LoanId, SymValue<'tcx>),
@@ -150,14 +172,19 @@ impl Display for SymValue<'_> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct SymValue<'tcx>(Rc<SymValueI<'tcx>>);
+pub struct SymValue<'tcx>(Rc<SymValueI<'tcx>>);
 
 impl<'tcx> SymValue<'tcx> {
-    fn constructor(nm: Symbol, id: DefId, args: GenericArgsRef<'tcx>, fields: Vec<Self>) -> Self {
+    pub fn constructor(
+        nm: Symbol,
+        id: DefId,
+        args: GenericArgsRef<'tcx>,
+        fields: Vec<Self>,
+    ) -> Self {
         SymValue(Rc::new(SymValueI::Constructor { nm, id, args, fields }))
     }
 
-    fn borrow(m: Mutability, l: LoanId, v: Self) -> Self {
+    pub fn borrow(m: Mutability, l: LoanId, v: Self) -> Self {
         SymValue(Rc::new(SymValueI::Borrow(m, l, v)))
     }
 
@@ -165,7 +192,7 @@ impl<'tcx> SymValue<'tcx> {
         SymValue(Rc::new(SymValueI::Loan(l)))
     }
 
-    fn tuple(fields: Vec<Self>) -> Self {
+    pub fn tuple(fields: Vec<Self>) -> Self {
         SymValue(Rc::new(SymValueI::Tuple(fields)))
     }
 
@@ -177,11 +204,11 @@ impl<'tcx> SymValue<'tcx> {
         SymValue(Rc::new(SymValueI::Wild))
     }
 
-    fn box_(inner: Self) -> Self {
+    pub fn box_(inner: Self) -> Self {
         SymValue(Rc::new(SymValueI::Box(inner)))
     }
 
-    fn symbolic(ty: Ty<'tcx>, id: usize) -> Self {
+    pub fn symbolic(ty: Ty<'tcx>, id: usize) -> Self {
         SymValue(Rc::new(SymValueI::Symbolic(ty, id)))
     }
 
@@ -253,7 +280,7 @@ impl<'tcx> Deref for SymValue<'tcx> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
-enum LoanId {
+pub enum LoanId {
     Id(usize),
     Wild,
 }
@@ -265,7 +292,7 @@ struct Substitution {
 }
 
 #[derive(Clone, PartialEq)]
-struct Environ<'tcx> {
+pub struct Environ<'tcx> {
     map: HashMap<Local, SymValue<'tcx>>,
 }
 
@@ -303,6 +330,7 @@ impl Display for Environ<'_> {
     }
 }
 
+#[derive(Clone, Debug)]
 enum GhostAction<'tcx> {
     Unfold(Ty<'tcx>),
     Fold(Ty<'tcx>),
@@ -311,7 +339,6 @@ enum GhostAction<'tcx> {
 struct SymState<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     env: Environ<'tcx>,
-    ghost_actions: RefCell<Vec<GhostAction<'tcx>>>,
     fresh_loan: Cell<usize>,
     fresh_sym: Cell<usize>,
     locals: &'a LocalDecls<'tcx>,
@@ -319,10 +346,9 @@ struct SymState<'a, 'tcx> {
 }
 
 #[derive(Default)]
-struct SymResults<'tcx> {
-    envs: HashMap<BasicBlock, Environ<'tcx>>,
+pub struct SymResults<'tcx> {
+    pub envs: HashMap<Location, Environ<'tcx>>,
     // Ghost actions to take before executing the given location.
-    ghost_actions: HashMap<Location, Vec<GhostAction<'tcx>>>,
 }
 
 fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> SymValue<'tcx> {
@@ -476,7 +502,6 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             _ => self.tcx.dcx().fatal("unsupported type"),
         };
 
-        self.ghost_actions.borrow_mut().push(GhostAction::Unfold(ty));
         Some(new_val)
     }
 
@@ -857,10 +882,13 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
         }
     }
 
-    fn eval_block(&mut self, b: BasicBlock,results: &mut SymResults<'tcx>,) -> Vec<BasicBlock> {
+    fn eval_block(&mut self, b: BasicBlock, results: &mut SymResults<'tcx>) -> Vec<BasicBlock> {
+        let mut loc = b.start_location();
+        assert!(results.envs.contains_key(&loc));
         for s in &self.body[b].statements {
             self.eval_statement(s);
-            let _ = std::mem::take(&mut self.ghost_actions);
+            loc = loc.successor_within_block();
+            results.envs.insert(loc, self.env.clone());
         }
 
         let res = self.eval_terminator(self.body[b].terminator());
@@ -874,7 +902,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             let fresh = self.fresh_sym(self.locals[a].ty);
             self.env.map.insert(a, fresh);
         }
-        results.envs. insert(START_BLOCK, self.env.clone());
+        results.envs.insert(START_BLOCK.start_location(), self.env.clone());
 
         let graph = node_graph(self.body);
         let wto = weak_topological_order(&graph, START_BLOCK);
@@ -891,33 +919,31 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
     ) {
         match component {
             Component::Vertex(bb) => {
-                // eprintln!("{bb:?} {}", results.get(bb).unwrap());
                 let dests = self.eval_block(*bb, results);
                 for d in dests {
-                    results.envs
-                        .entry(d)
+                    results
+                        .envs
+                        .entry(d.start_location())
                         .and_modify(|env| self.join_env(env, &self.env))
                         .or_insert_with(|| self.env.clone());
                 }
             }
             Component::Component(h, body) => {
-                let mut old = results.envs.get(&h).cloned().unwrap();
+                let mut old = results.envs.get(&h.start_location()).cloned().unwrap();
                 let mut num_iter = 0;
                 while num_iter < 3 {
-                    self.eval_block(*h, results);
+                    self.eval_component(results, &Component::Vertex(*h));
 
                     for b in body {
                         self.eval_component(results, b);
                     }
 
-                    let new = results.envs.get(&h);
+                    let new = results.envs.get(&h.start_location());
                     let new = &**new.as_ref().unwrap();
                     let mut subst = Substitution::default();
 
                     let unified = old.weak_unification(new, &mut subst);
-                    eprintln!("{old}");
-                    eprintln!("{new}");
-                    eprintln!("{unified}");
+
                     if !unified {
                         old = new.clone();
                         num_iter += 1;
@@ -925,7 +951,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
                         break;
                     }
                 }
-                self.invariants_between(&old, results.envs.get(&h).unwrap());
+                self.invariants_between(&old, results.envs.get(&h.start_location()).unwrap());
             }
         }
     }
@@ -1087,7 +1113,10 @@ pub(crate) fn node_graph(x: &Body) -> petgraph::graphmap::DiGraphMap<BasicBlock,
     graph
 }
 
-pub(crate) fn run_analysis<'tcx>(tcx: TyCtxt<'tcx>, def_id: rustc_hir::def_id::LocalDefId) {
+pub(crate) fn run_analysis<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: rustc_hir::def_id::LocalDefId,
+) -> SymResults<'tcx> {
     let a: &BodyWithBorrowckFacts<'tcx> = MIR_BODIES
         .with(|state| {
             let map = state.borrow_mut();
@@ -1105,10 +1134,10 @@ pub(crate) fn run_analysis<'tcx>(tcx: TyCtxt<'tcx>, def_id: rustc_hir::def_id::L
         fresh_sym: Cell::new(0),
         locals: &body.local_decls,
         body: &body,
-        ghost_actions: RefCell::new(Vec::new())
     };
 
     let mut results = SymResults::default();
 
     state.eval_body(&mut results);
+    results
 }

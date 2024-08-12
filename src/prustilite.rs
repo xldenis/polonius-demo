@@ -1,27 +1,35 @@
 use rustc_abi::Size;
+use rustc_hir::def::DefKind;
 use rustc_middle::{
     mir::{
-        BasicBlock, BinOp, Body, BorrowKind, Operand, Place, ProjectionElem, Rvalue, Statement,
-        Terminator, TerminatorKind, START_BLOCK,
+        tcx::PlaceTy, BasicBlock, BinOp, Body, BorrowKind, Local, Operand, Place, ProjectionElem,
+        Rvalue, Statement, Terminator, TerminatorKind, START_BLOCK,
     },
-    ty::TyCtxt,
+    ty::{List, Ty, TyCtxt, TyKind},
 };
+use rustc_span::Symbol;
+use rustc_target::abi::VariantIdx;
 use std::io::{Result, Write};
 
 use crate::{
-    aenealite::node_graph,
+    aenealite::{for_all_vars, node_graph, Environ, LoanId, SymResults, SymValue, SymValueI},
     wto::{weak_topological_order, Component},
 };
 
 /// Emit viper methods for mir functions in a prusti style
 ///
 
-pub fn encode_body<'tcx>(f: &mut dyn Write, tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Result<()> {
+pub fn encode_body<'tcx>(
+    f: &mut dyn Write,
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    res: &SymResults<'tcx>,
+) -> Result<()> {
     let graph = node_graph(body);
     let wto = weak_topological_order(&graph, START_BLOCK);
 
     for c in wto {
-        encode_component(f, tcx, body, &c)?;
+        encode_component(f, tcx, body, &c, res)?;
     }
     Ok(())
 }
@@ -31,10 +39,11 @@ fn encode_component<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     c: &Component<BasicBlock>,
+    res: &SymResults<'tcx>,
 ) -> Result<()> {
     match c {
-        Component::Vertex(bb) => encode_block(f, tcx, body, *bb),
-        Component::Component(h, bdy) => encode_loop(f, tcx, body, *h, &bdy),
+        Component::Vertex(bb) => encode_block(f, tcx, body, *bb, res),
+        Component::Component(h, bdy) => encode_loop(f, tcx, body, *h, &bdy, res),
     }
 }
 
@@ -45,10 +54,11 @@ fn encode_loop<'tcx>(
     body: &Body<'tcx>,
     head: BasicBlock,
     bdy: &[Component<BasicBlock>],
+    res: &SymResults<'tcx>,
 ) -> Result<()> {
-    encode_block(f, tcx, body, head)?;
+    encode_block(f, tcx, body, head, res)?;
     for bb in bdy {
-        encode_component(f, tcx, body, bb)?;
+        encode_component(f, tcx, body, bb, res)?;
     }
     Ok(())
 }
@@ -58,10 +68,43 @@ fn encode_block<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     bb: BasicBlock,
+    res: &SymResults<'tcx>,
 ) -> Result<()> {
     writeln!(f, "label {bb:?};")?;
+    let mut loc = bb.start_location();
+    println!("{}", res.envs.get(&loc).unwrap_or_else(|| panic!("{loc:?}")));
+
     for s in &body[bb].statements {
+        let prev_env = res.envs.get(&loc).unwrap();
+        loc = loc.successor_within_block();
+        let env = res.envs.get(&loc).unwrap();
+        let mut out = Vec::new();
+        for_all_vars(prev_env, env, |l, pre, post| match (pre, post) {
+            (Some(pre), None) => eprintln!("killing {pre}"),
+            (None, Some(post)) => eprintln!("creating {post}"),
+            (Some(pre), Some(post)) => {
+                if pre != post {
+                    eprintln!("comparing {pre} {post}");
+                }
+                fold_unfold(
+                    tcx,
+                    l,
+                    PlaceTy::from_ty(body.local_decls[l].ty),
+                    Vec::new(),
+                    pre,
+                    post,
+                    &mut out,
+                );
+            },
+            _ => unreachable!()
+        });
+
+        for f_or_f in out {
+            println!("fold_or_unfold: {f_or_f:?}")
+        }
+
         encode_statement(f, tcx, body, s)?;
+        println!("{}", res.envs.get(&loc).unwrap_or_else(|| panic!("{loc:?}")));
     }
     encode_terminator(f, tcx, body, &body[bb].terminator())
 }
@@ -269,3 +312,168 @@ fn encode_terminator<'tcx>(
         }
     }
 }
+
+fn fold_unfold<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    loc: Local,
+    pty: PlaceTy<'tcx>,
+    mut base: Vec<ProjectionElem<Local, Ty<'tcx>>>,
+    pre: SymValue<'tcx>,
+    post: SymValue<'tcx>,
+    out: &mut Vec<Place<'tcx>>,
+) {
+    if pre == post {
+        return;
+    }
+    match (&*pre, &*post) {
+        (SymValueI::Borrow(_, _, p), SymValueI::Borrow(_, _, q)) => {
+            base.push(ProjectionElem::Deref);
+            let pty = pty.projection_ty(tcx, ProjectionElem::Deref);
+            fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+        }
+        (
+            SymValueI::Constructor { id, nm, fields: ps, .. },
+            SymValueI::Constructor { fields: qs, .. },
+        ) => {
+            let type_id = match tcx.def_kind(*id) {
+                DefKind::Variant => tcx.parent(*id),
+                _ => *id,
+            };
+            let adt = tcx.adt_def(type_id);
+
+            let vix = adt.variant_index_with_id(*id);
+            base.push(ProjectionElem::Downcast(Some(*nm), vix));
+            let pty = pty.projection_ty(tcx, ProjectionElem::Downcast(Some(*nm), vix));
+
+            for (ix, (p, q)) in ps.iter().zip(qs).enumerate() {
+                if p == q {
+                    continue;
+                }
+                let pty = pty;
+                let ty = pty.field_ty(tcx, ix.into());
+                let mut base = base.clone();
+                base.push(ProjectionElem::Field(ix.into(), ty));
+                let pty = pty.projection_ty(tcx, ProjectionElem::Field(ix.into(), ty));
+                fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+            }
+        }
+        (SymValueI::Tuple(ps), SymValueI::Tuple(qs)) => {
+            for (ix, (p, q)) in ps.iter().zip(qs).enumerate() {
+                if p == q {
+                    continue;
+                }
+                let mut base = base.clone();
+                let ty = pty.field_ty(tcx, ix.into());
+                base.push(ProjectionElem::Field(ix.into(), ty));
+                let pty = pty.projection_ty(tcx, ProjectionElem::Field(ix.into(), ty));
+                fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+            }
+        }
+        (SymValueI::Box(p), SymValueI::Box(q)) => {
+            base.push(ProjectionElem::Deref);
+            fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+        }
+        (SymValueI::Symbolic(_, _), SymValueI::Symbolic(_, _)) => {}
+        (SymValueI::Symbolic(ty, _), _) => {
+            if let Some(val) = unfold(tcx, *ty, None) {
+                out.push(Place { local: loc, projection: tcx.mk_place_elems(&base[..]) });
+
+                // base.clone());
+                fold_unfold(tcx, loc, pty, base, val, post, out);
+            }
+            // unfold
+            //
+        }
+        (_, SymValueI::Symbolic(_, _)) => {
+            // Treat folding as a symetric case to unfolding: flip the two arguments around and then at the end flip the interepretation of `fold / unfold` ?
+            fold_unfold(tcx, loc, pty, base, post, pre, out)
+        }
+        _ => todo!("no fold / unfold needed / possible"),
+    }
+}
+
+/// Unfold a symbolic value and fully replace it everywhere in the symbolic environment.
+fn unfold<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    variant: Option<VariantIdx>,
+) -> Option<SymValue<'tcx>> {
+    let new_val = match ty.kind() {
+        TyKind::Bool => return None,
+        TyKind::Char => return None,
+        TyKind::Int(_) => return None,
+        TyKind::Uint(_) => return None,
+        TyKind::Float(_) => return None,
+        TyKind::Str => return None,
+        TyKind::Ref(_, ty, mutbl) => {
+            SymValue::borrow(*mutbl, LoanId::Wild, SymValue::symbolic(*ty, 0))
+        }
+
+        TyKind::Tuple(fields) => {
+            let fields = fields.iter().map(|ty| SymValue::symbolic(ty, 0)).collect();
+            SymValue::tuple(fields)
+        }
+
+        TyKind::Adt(adt, substs) => {
+            if adt.variants().len() > 1 && variant.is_none() {
+                return None;
+            }
+            // assert!(adt.variants().len() == 1 || variant.is_some());
+
+            let variant = &adt.variants()[variant.unwrap_or(0u32.into())];
+            let fields: Vec<_> = variant
+                .fields
+                .iter()
+                .map(|field| SymValue::symbolic(field.ty(tcx, substs), 0))
+                .collect();
+            let nm = variant.ident(tcx).name;
+
+            if adt.is_box() {
+                SymValue::box_(SymValue::symbolic(substs.type_at(0), 0))
+            } else {
+                SymValue::constructor(nm, variant.def_id, substs, fields)
+            }
+        }
+        _ => tcx.dcx().fatal("unsupported type"),
+    };
+
+    Some(new_val)
+}
+
+// fn diff_terms<'tcx>(
+//     base: WandTerm,
+//     l: &SymValue<'tcx>,
+//     r: &SymValue<'tcx>,
+//     out: &mut Vec<(WandTerm, WandTerm)>,
+// ) {
+//     if l == r {
+//         return;
+//     }
+
+//     match (&**l, &**r) {
+//         (SymValueI::Symbolic(_, _), SymValueI::Symbolic(_, _)) => {
+//             out.push((WandTerm::Old(Box::new(base.clone())), base))
+//         }
+//         (SymValueI::Loan(_), SymValueI::Loan(_)) => todo!("loan?"),
+//         (SymValueI::Borrow(_, _, l2), SymValueI::Borrow(_, _, r2)) => {
+//             diff_terms(WandTerm::Deref(Box::new(base)), l2, r2, out)
+//         }
+//         (SymValueI::Constructor { .. }, SymValueI::Constructor { .. }) => todo!(),
+//         (SymValueI::Tuple(fs), SymValueI::Tuple(gs)) => {
+//             for (ix, (f, g)) in fs.iter().zip(gs).enumerate() {
+//                 if f == g {
+//                     continue;
+//                 }
+
+//                 let base = WandTerm::Field(Box::new(base.clone()), ix.into());
+//                 diff_terms(base, f, g, out)
+//             }
+//         }
+//         (SymValueI::Box(l2), SymValueI::Box(r2)) => {
+//             diff_terms(WandTerm::Deref(Box::new(base)), l2, r2, out)
+//         }
+//         (SymValueI::Wild, SymValueI::Wild) => (),
+//         (SymValueI::Uninit, SymValueI::Uninit) => (),
+//         _ => todo!("differing left and rightss"),
+//     }
+// }

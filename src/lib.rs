@@ -4,6 +4,7 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
+use aenealite::SymResults;
 use prustilite::encode_body;
 use rustc_borrowck::consumers::{BodyWithBorrowckFacts, ConsumerOptions};
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -85,7 +86,7 @@ impl Callbacks for PoloniusDemo {
     }
 }
 
-fn prustilite_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
+fn prustilite_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, res: SymResults<'tcx>) {
     let a: &BodyWithBorrowckFacts<'tcx> = MIR_BODIES
         .with(|state| {
             let map = state.borrow_mut();
@@ -96,13 +97,13 @@ fn prustilite_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
         })
         .expect("expected to find body");
     let body = &a.body;
-    encode_body(&mut std::io::stdout(), tcx, body).unwrap();
+    encode_body(&mut std::io::stdout(), tcx, body, &res).unwrap();
 }
 
 fn run<'tcx>(tcx: TyCtxt<'tcx>) {
     for def_id in tcx.hir().body_owners() {
         // debug::polonius_facts(tcx, def_id);
-        aenealite::run_analysis(tcx, def_id);
-        prustilite_body(tcx, def_id);
+        let res = aenealite::run_analysis(tcx, def_id);
+        prustilite_body(tcx, def_id, res);
     }
 }
