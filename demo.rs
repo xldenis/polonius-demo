@@ -28,41 +28,41 @@
 //   * p.1 = 5;
 // }
 
-fn aeneas() {
-  let mut x = 0;
-  let mut p = &mut x;
+// fn aeneas() {
+//   let mut x = 0;
+//   let mut p = &mut x;
 
-  loop {
-    // invariant acc(p);
-    // invariant acc(p) -* acc(p)
-    p = &mut * p;
-    *p += 1;
-    continue
-  }
-}
+//   while *p < 10000 {
+//     // invariant acc(p);
+//     // invariant acc(p) -* acc(p)
+//     p = &mut * p;
+//     *p += 1;
+//     continue
+//   }
+// }
 
 // fn main() {
 
 // }
 
-// enum List {
-//   Cons(i32, Box<List>),
-//   Nil
-// }
+enum List {
+  Cons(i32, Box<List>),
+  Nil
+}
 
-// fn all_zero(mut x : &mut List) {
-//   // {_1: σ(0), }
-//   // {_1: &mut loan(5) σ(11) }
-//   while let List::Cons(i, tl) = x {
-//     // invariant acc(x)
-//     // invariant acc(x) -* acc(old(x ))
-//     *i = 0;
+fn all_zero(mut x : &mut List) {
+  // {_1: σ(0), }
+  // {_1: &mut loan(5) σ(11) }
+  while let List::Cons(i, tl) = x {
+    // invariant acc(x)
+    // invariant acc(x) -* acc(old(x ))
+    *i = 0;
               
 
-//     x = tl;
-//   }
-//   // {_1: &mut loan(24) σ(40), _2: (), }
-// }
+    x = tl;
+  }
+  // {_1: &mut loan(24) σ(40), _2: (), }
+}
 
 
 // fn nth(mut x : &mut List, mut ix : usize) -> &mut i32 {

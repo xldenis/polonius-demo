@@ -175,6 +175,19 @@ impl Display for SymValue<'_> {
 pub struct SymValue<'tcx>(Rc<SymValueI<'tcx>>);
 
 impl<'tcx> SymValue<'tcx> {
+    pub fn has_loan(&self) -> bool {
+        match &**self {
+            SymValueI::Symbolic(_, _) => false,
+            SymValueI::Loan(_) => true,
+            SymValueI::Borrow(_, _, l) => l.has_loan(),
+            SymValueI::Constructor { fields, .. } => fields.iter().any(|f| f.has_loan()),
+            SymValueI::Tuple(fields) => fields.iter().any(|f| f.has_loan()),
+            SymValueI::Box(l) => l.has_loan(),
+            SymValueI::Wild => false,
+            SymValueI::Uninit => false,
+        }
+    }
+
     pub fn constructor(
         nm: Symbol,
         id: DefId,
@@ -293,11 +306,11 @@ struct Substitution {
 
 #[derive(Clone, PartialEq)]
 pub struct Environ<'tcx> {
-    map: HashMap<Local, SymValue<'tcx>>,
+    pub map: HashMap<Local, SymValue<'tcx>>,
 }
 
 impl<'tcx> Environ<'tcx> {
-    fn get(&self, l: Local) -> Option<SymValue<'tcx>> {
+    pub fn get(&self, l: Local) -> Option<SymValue<'tcx>> {
         self.map.get(&l).cloned()
     }
 
@@ -347,8 +360,10 @@ struct SymState<'a, 'tcx> {
 
 #[derive(Default)]
 pub struct SymResults<'tcx> {
+    // Environment upon entry to a loop. Necessary to calculate loop invariants
+    pub pre_loop_env: HashMap<Location, Environ<'tcx>>,
+    // Environment at entry to a statement. For loops this is the fix point environment.
     pub envs: HashMap<Location, Environ<'tcx>>,
-    // Ghost actions to take before executing the given location.
 }
 
 fn replace_sym<'tcx>(this: SymValue<'tcx>, ix: usize, val: SymValue<'tcx>) -> SymValue<'tcx> {
@@ -930,6 +945,7 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
             }
             Component::Component(h, body) => {
                 let mut old = results.envs.get(&h.start_location()).cloned().unwrap();
+                results.pre_loop_env.insert(h.start_location(), old.clone());
                 let mut num_iter = 0;
                 while num_iter < 3 {
                     self.eval_component(results, &Component::Vertex(*h));
@@ -951,52 +967,12 @@ impl<'a, 'tcx> SymState<'a, 'tcx> {
                         break;
                     }
                 }
-                self.invariants_between(&old, results.envs.get(&h.start_location()).unwrap());
             }
-        }
-    }
-
-    /// Calculate the loop invariant given a state immediately before a loop and a state immediately afterwards.
-    fn invariants_between(&self, pre: &Environ<'tcx>, post: &Environ<'tcx>) {
-        let mut changed = HashMap::new();
-        let mut affected_lifetimes: HashMap<_, HashSet<_>> = HashMap::new();
-        for (k, v) in &pre.map {
-            if post.get(*k) != Some(v.clone()) {
-                changed.insert(k, v);
-
-                let rust_ty = self.body.local_decls[*k].ty;
-                let mut col = RegionCollector { regions: Default::default() };
-                col.visit_ty(rust_ty);
-
-                for lft in col.regions {
-                    affected_lifetimes.entry(lft).or_default().insert(*k);
-                }
-            }
-        }
-
-        eprintln!("needing magic wands {:?}", affected_lifetimes);
-
-        for (lft, vars) in affected_lifetimes {
-            let mut out = Vec::new();
-            for var in vars {
-                diff_terms(
-                    WandTerm::Var(var),
-                    &pre.get(var).unwrap(),
-                    &post.get(var).unwrap(),
-                    &mut out,
-                );
-            }
-            let (pres, posts) = out.into_iter().unzip();
-
-            let post = WandTerm::Conj(posts);
-            let pre = WandTerm::Conj(pres);
-            let wand = WandTerm::Wand(Box::new(post), Box::new(pre));
-            eprintln!("wand associated to {lft:?}: {wand}");
         }
     }
 }
 
-fn diff_terms<'tcx>(
+pub fn diff_terms<'tcx>(
     base: WandTerm,
     l: &SymValue<'tcx>,
     r: &SymValue<'tcx>,
@@ -1030,14 +1006,14 @@ fn diff_terms<'tcx>(
         }
         (SymValueI::Wild, SymValueI::Wild) => (),
         (SymValueI::Uninit, SymValueI::Uninit) => (),
-        _ => todo!("differing left and rightss"),
+        _ => out.push((WandTerm::Old(Box::new(base.clone())), base))
     }
 }
 
 /// Hrm... should this actually have Place instead? It seems counter productive to do sym value
 /// Lets start with a `symvalue ` here even if that's counterproductive in the long term
 #[derive(Debug, Clone)]
-enum WandTerm {
+pub enum WandTerm {
     Old(Box<WandTerm>),
     Var(Local),
     Deref(Box<WandTerm>),
@@ -1080,8 +1056,9 @@ impl<'tcx> std::fmt::Display for WandTerm {
     }
 }
 
-struct RegionCollector {
-    regions: HashSet<RegionVid>,
+#[derive(Default)]
+pub struct RegionCollector {
+    pub regions: HashSet<RegionVid>,
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for RegionCollector {

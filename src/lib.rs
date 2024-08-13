@@ -102,7 +102,7 @@ fn prustilite_body<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, res: SymResults<
 
 fn run<'tcx>(tcx: TyCtxt<'tcx>) {
     for def_id in tcx.hir().body_owners() {
-        // debug::polonius_facts(tcx, def_id);
+        debug::polonius_facts(tcx, def_id);
         let res = aenealite::run_analysis(tcx, def_id);
         prustilite_body(tcx, def_id, res);
     }

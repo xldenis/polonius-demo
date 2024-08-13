@@ -145,11 +145,11 @@ pub fn polonius_facts<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) {
 
                 let old = state(&output_facts, &reg_ctx, &scc_repr, old.into());
                 let ix_state = state(&output_facts, &reg_ctx, &scc_repr, ix.into());
-                if old != ix_state {
-                    eprintln!("{old}");
-                }
+                // if old != ix_state {
+                //     eprintln!("{old}");
+                // }
 
-                eprintln!("{ix_state}");
+                // eprintln!("{ix_state}");
 
                 let news: BTreeSet<_> = new_regions.difference(&old_regions).collect();
                 if !news.is_empty() {

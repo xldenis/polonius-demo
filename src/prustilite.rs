@@ -5,14 +5,21 @@ use rustc_middle::{
         tcx::PlaceTy, BasicBlock, BinOp, Body, BorrowKind, Local, Operand, Place, ProjectionElem,
         Rvalue, Statement, Terminator, TerminatorKind, START_BLOCK,
     },
-    ty::{List, Ty, TyCtxt, TyKind},
+    ty::{List, Ty, TyCtxt, TyKind, TypeVisitor},
 };
 use rustc_span::Symbol;
 use rustc_target::abi::VariantIdx;
-use std::io::{Result, Write};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    io::{Result, Write},
+};
 
 use crate::{
-    aenealite::{for_all_vars, node_graph, Environ, LoanId, SymResults, SymValue, SymValueI},
+    aenealite::{
+        diff_terms, for_all_vars, node_graph, Environ, LoanId, RegionCollector, SymResults,
+        SymValue, SymValueI, WandTerm,
+    },
     wto::{weak_topological_order, Component},
 };
 
@@ -31,6 +38,7 @@ pub fn encode_body<'tcx>(
     for c in wto {
         encode_component(f, tcx, body, &c, res)?;
     }
+    writeln!(f, "");
     Ok(())
 }
 
@@ -72,40 +80,68 @@ fn encode_block<'tcx>(
 ) -> Result<()> {
     writeln!(f, "label {bb:?};")?;
     let mut loc = bb.start_location();
-    println!("{}", res.envs.get(&loc).unwrap_or_else(|| panic!("{loc:?}")));
+    if let Some(pre_loop) = res.pre_loop_env.get(&loc) {
+        invariants_between(f, body, pre_loop, res.envs.get(&loc).unwrap());
+    }
+    // println!("// {}", res.envs.get(&loc).unwrap_or_else(|| panic!("{loc:?}")));
 
     for s in &body[bb].statements {
         let prev_env = res.envs.get(&loc).unwrap();
         loc = loc.successor_within_block();
         let env = res.envs.get(&loc).unwrap();
         let mut out = Vec::new();
-        for_all_vars(prev_env, env, |l, pre, post| match (pre, post) {
-            (Some(pre), None) => eprintln!("killing {pre}"),
-            (None, Some(post)) => eprintln!("creating {post}"),
-            (Some(pre), Some(post)) => {
-                if pre != post {
-                    eprintln!("comparing {pre} {post}");
+        let mut exhales = String::new();
+        for_all_vars(prev_env, env, |l, pre, post| {
+            let pty = PlaceTy::from_ty(body.local_decls[l].ty);
+            match (pre, post) {
+                (Some(pre), None) => {
+                    if pre.has_loan() {
+                        return;
+                    }
+                    let mut out = Vec::new();
+                    // Try folding up `pre` again
+                    fold_unfold(
+                        tcx,
+                        FoldUnfold::Unfold,
+                        l,
+                        pty,
+                        Vec::new(),
+                        pre.clone(),
+                        SymValue::symbolic(pty.ty, 0),
+                        &mut out,
+                    );
+                    for (comm, pl) in out {
+                        writeln!(&mut exhales, " {comm}({pl:?});").unwrap();
+                    }
+
+                    // let mut out = Vec::new();
+                    // val_to_place(tcx, l, pty, Vec::new(), &pre, &mut out);
+                    // for pl in out {
+                    writeln!(&mut exhales, "  exhale {l:?};").unwrap();
+                    // }
                 }
-                fold_unfold(
-                    tcx,
-                    l,
-                    PlaceTy::from_ty(body.local_decls[l].ty),
-                    Vec::new(),
-                    pre,
-                    post,
-                    &mut out,
-                );
-            },
-            _ => unreachable!()
+                (None, Some(_post)) => {
+                    writeln!(f, "  var {l:?} : Ref := new(*);").unwrap();
+                }
+                (Some(pre), Some(post)) => {
+                    // if pre == post {
+                    //     eprintln!("comparing {pre} {post}");
+                    // }
+                    fold_unfold(tcx, FoldUnfold::Unfold, l, pty, Vec::new(), pre, post, &mut out);
+                }
+                _ => unreachable!(),
+            }
         });
 
-        for f_or_f in out {
-            println!("fold_or_unfold: {f_or_f:?}")
-        }
+        // for f_or_f in out {
+        //     println!("fold_or_unfold: {f_or_f:?}")
+        // }
 
         encode_statement(f, tcx, body, s)?;
-        println!("{}", res.envs.get(&loc).unwrap_or_else(|| panic!("{loc:?}")));
+        write!(f, "{exhales}")?;
+        // println!("// {}", res.envs.get(&loc).unwrap_or_else(|| panic!("{loc:?}")));
     }
+    write!(f, "  ")?;
     encode_terminator(f, tcx, body, &body[bb].terminator())
 }
 
@@ -117,6 +153,7 @@ fn encode_statement<'tcx>(
 ) -> Result<()> {
     match &s.kind {
         rustc_middle::mir::StatementKind::Assign(asgn) => {
+            write!(f, "  ")?;
             encode_assign(f, tcx, body, &asgn.0, &asgn.1)?;
         }
         rustc_middle::mir::StatementKind::SetDiscriminant { place, variant_index } => {
@@ -168,23 +205,30 @@ fn encode_assign<'tcx>(
     asgn_2: &Rvalue<'tcx>,
 ) -> Result<()> {
     encode_place(f, tcx, body, *asgn_1)?;
-    if let Rvalue::Ref(_, BorrowKind::Mut { .. }, _) = asgn_2 {
-        write!(f, ".deref")?;
-    }
+    // if let Rvalue::Ref(_, BorrowKind::Mut { .. }, _) = asgn_2 {
+    //     write!(f, ".deref")?;
+    // }
     write!(f, ":=")?;
     match asgn_2 {
         Rvalue::Use(op) => encode_operand(f, tcx, body, op.clone()),
         Rvalue::UnaryOp(_, _) => todo!(),
-        Rvalue::Discriminant(_) => todo!(),
+        Rvalue::Discriminant(pl) => {
+            encode_place(f, tcx, body, *pl)?;
+            write!(f, ".discr")
+        },
         Rvalue::Aggregate(_, _) => todo!(),
         Rvalue::Ref(_, BorrowKind::Mut { .. }, pl) => {
             // TODO need to add a deref to lhs
-            encode_place(f, tcx, body, *pl)
+            let pl = if pl.projection.get(0) == Some(&ProjectionElem::Deref) {
+                Place { local: pl.local, projection: tcx.mk_place_elems(&pl.projection[1..]) }
+            } else {
+                *pl
+            };
+            encode_place(f, tcx, body, pl)
         }
         Rvalue::Ref(_, _, _) => todo!("shared borrow"),
         Rvalue::Cast(_, _, _) => todo!(),
-        Rvalue::BinaryOp(_, _) => todo!(),
-        Rvalue::CheckedBinaryOp(op, ops) => {
+        Rvalue::BinaryOp(op, ops) | Rvalue::CheckedBinaryOp(op, ops) => {
             encode_operand(f, tcx, body, ops.0.clone())?;
             encode_binop(f, *op)?;
             encode_operand(f, tcx, body, ops.1.clone())
@@ -289,21 +333,32 @@ fn encode_terminator<'tcx>(
 ) -> Result<()> {
     match &bb.kind {
         TerminatorKind::Goto { target } => writeln!(f, "goto {target:?};"),
-        TerminatorKind::SwitchInt { discr, targets } => todo!(),
+        TerminatorKind::SwitchInt { discr, targets } => {
+            write!(f, "var discr := ")?;
+            encode_operand(f, tcx, body, discr.clone())?;
+            writeln!(f, ";")?;
+            use std::iter::*;
+            let headers = once("if").chain(vec!["if else"; targets.iter().len() - 1]);
+            for (hdr, (ix, tgt)) in headers.zip(targets.iter()) {
+                writeln!(f, "  {hdr} (discr == {ix}) {{ goto {tgt:?}; }}")?;
+            }
+            writeln!(f, "  else {{ goto {:?}; }}", targets.otherwise())?;
+            Ok(())
+        }
         TerminatorKind::Return => writeln!(f, "return;"),
         TerminatorKind::Unreachable => todo!(),
-        TerminatorKind::Drop { place, target, unwind, replace } => todo!(),
-        TerminatorKind::Call { func, args, destination, target, unwind, call_source, fn_span } => {
+        TerminatorKind::Drop { .. } => todo!(),
+        TerminatorKind::Call { .. } => {
             todo!()
         }
-        TerminatorKind::Assert { cond, expected, msg, target, unwind } => {
+        TerminatorKind::Assert { cond, target, .. } => {
             write!(f, "assert ")?;
             encode_operand(f, tcx, body, cond.clone())?;
             writeln!(f, ";")?;
 
             writeln!(f, "goto {target:?}")
         }
-        TerminatorKind::FalseEdge { real_target, imaginary_target } => {
+        TerminatorKind::FalseEdge { real_target, .. } => {
             writeln!(f, "goto {real_target:?}")
         }
         TerminatorKind::FalseUnwind { real_target, .. } => writeln!(f, "goto {real_target:?}"),
@@ -313,14 +368,30 @@ fn encode_terminator<'tcx>(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FoldUnfold {
+    Fold,
+    Unfold,
+}
+
+impl std::fmt::Display for FoldUnfold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FoldUnfold::Fold => write!(f, "fold"),
+            FoldUnfold::Unfold => write!(f, "unfold"),
+        }
+    }
+}
+
 fn fold_unfold<'tcx>(
     tcx: TyCtxt<'tcx>,
+    mode: FoldUnfold,
     loc: Local,
     pty: PlaceTy<'tcx>,
     mut base: Vec<ProjectionElem<Local, Ty<'tcx>>>,
     pre: SymValue<'tcx>,
     post: SymValue<'tcx>,
-    out: &mut Vec<Place<'tcx>>,
+    out: &mut Vec<(FoldUnfold, Place<'tcx>)>,
 ) {
     if pre == post {
         return;
@@ -329,7 +400,7 @@ fn fold_unfold<'tcx>(
         (SymValueI::Borrow(_, _, p), SymValueI::Borrow(_, _, q)) => {
             base.push(ProjectionElem::Deref);
             let pty = pty.projection_ty(tcx, ProjectionElem::Deref);
-            fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+            fold_unfold(tcx, mode, loc, pty, base, p.clone(), q.clone(), out);
         }
         (
             SymValueI::Constructor { id, nm, fields: ps, .. },
@@ -354,7 +425,7 @@ fn fold_unfold<'tcx>(
                 let mut base = base.clone();
                 base.push(ProjectionElem::Field(ix.into(), ty));
                 let pty = pty.projection_ty(tcx, ProjectionElem::Field(ix.into(), ty));
-                fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+                fold_unfold(tcx, mode, loc, pty, base, p.clone(), q.clone(), out);
             }
         }
         (SymValueI::Tuple(ps), SymValueI::Tuple(qs)) => {
@@ -366,29 +437,35 @@ fn fold_unfold<'tcx>(
                 let ty = pty.field_ty(tcx, ix.into());
                 base.push(ProjectionElem::Field(ix.into(), ty));
                 let pty = pty.projection_ty(tcx, ProjectionElem::Field(ix.into(), ty));
-                fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+                fold_unfold(tcx, mode, loc, pty, base, p.clone(), q.clone(), out);
             }
         }
         (SymValueI::Box(p), SymValueI::Box(q)) => {
             base.push(ProjectionElem::Deref);
-            fold_unfold(tcx, loc, pty, base, p.clone(), q.clone(), out);
+            fold_unfold(tcx, mode, loc, pty, base, p.clone(), q.clone(), out);
         }
         (SymValueI::Symbolic(_, _), SymValueI::Symbolic(_, _)) => {}
         (SymValueI::Symbolic(ty, _), _) => {
             if let Some(val) = unfold(tcx, *ty, None) {
-                out.push(Place { local: loc, projection: tcx.mk_place_elems(&base[..]) });
+                out.push((mode, Place { local: loc, projection: tcx.mk_place_elems(&base[..]) }));
 
                 // base.clone());
-                fold_unfold(tcx, loc, pty, base, val, post, out);
+                fold_unfold(tcx, mode, loc, pty, base, val, post, out);
             }
             // unfold
             //
         }
-        (_, SymValueI::Symbolic(_, _)) => {
-            // Treat folding as a symetric case to unfolding: flip the two arguments around and then at the end flip the interepretation of `fold / unfold` ?
-            fold_unfold(tcx, loc, pty, base, post, pre, out)
+        (_, SymValueI::Symbolic(ty, _)) => {
+            if let Some(val) = unfold(tcx, *ty, None) {
+                out.push((FoldUnfold::Fold, Place { local: loc, projection: tcx.mk_place_elems(&base[..]) }));
+
+                // base.clone());
+                fold_unfold(tcx, FoldUnfold::Fold, loc, pty, base, pre, val, out);
+            }
         }
-        _ => todo!("no fold / unfold needed / possible"),
+        // ?? is this justified??
+        (_, SymValueI::Loan(_)) => {}
+        _ => todo!("no fold / unfold needed / possible {pre} {post}"),
     }
 }
 
@@ -440,40 +517,104 @@ fn unfold<'tcx>(
     Some(new_val)
 }
 
-// fn diff_terms<'tcx>(
-//     base: WandTerm,
-//     l: &SymValue<'tcx>,
-//     r: &SymValue<'tcx>,
-//     out: &mut Vec<(WandTerm, WandTerm)>,
-// ) {
-//     if l == r {
-//         return;
-//     }
+/// Returns the initialized place in a value
+fn val_to_place<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    local: Local,
+    pty: PlaceTy<'tcx>,
+    mut base: Vec<ProjectionElem<Local, Ty<'tcx>>>,
+    pre: &SymValue<'tcx>,
+    out: &mut Vec<Place<'tcx>>,
+) {
+    match &**pre {
+        SymValueI::Symbolic(ty, _) => {
+            assert_eq!(ty, &pty.ty);
+            out.push(Place { local, projection: tcx.mk_place_elems(&base[..]) });
+        }
+        SymValueI::Loan(_) => out.push(Place { local, projection: tcx.mk_place_elems(&base[..]) }),
+        SymValueI::Borrow(_, _, t) => {
+            base.push(ProjectionElem::Deref);
+            let pty = pty.projection_ty(tcx, ProjectionElem::Deref);
+            val_to_place(tcx, local, pty, base, t, out);
+        }
+        SymValueI::Constructor { nm, id, fields, .. } => {
+            let type_id = match tcx.def_kind(*id) {
+                DefKind::Variant => tcx.parent(*id),
+                _ => *id,
+            };
+            let adt = tcx.adt_def(type_id);
 
-//     match (&**l, &**r) {
-//         (SymValueI::Symbolic(_, _), SymValueI::Symbolic(_, _)) => {
-//             out.push((WandTerm::Old(Box::new(base.clone())), base))
-//         }
-//         (SymValueI::Loan(_), SymValueI::Loan(_)) => todo!("loan?"),
-//         (SymValueI::Borrow(_, _, l2), SymValueI::Borrow(_, _, r2)) => {
-//             diff_terms(WandTerm::Deref(Box::new(base)), l2, r2, out)
-//         }
-//         (SymValueI::Constructor { .. }, SymValueI::Constructor { .. }) => todo!(),
-//         (SymValueI::Tuple(fs), SymValueI::Tuple(gs)) => {
-//             for (ix, (f, g)) in fs.iter().zip(gs).enumerate() {
-//                 if f == g {
-//                     continue;
-//                 }
+            let vix = adt.variant_index_with_id(*id);
+            base.push(ProjectionElem::Downcast(Some(*nm), vix));
+            let pty = pty.projection_ty(tcx, ProjectionElem::Downcast(Some(*nm), vix));
 
-//                 let base = WandTerm::Field(Box::new(base.clone()), ix.into());
-//                 diff_terms(base, f, g, out)
-//             }
-//         }
-//         (SymValueI::Box(l2), SymValueI::Box(r2)) => {
-//             diff_terms(WandTerm::Deref(Box::new(base)), l2, r2, out)
-//         }
-//         (SymValueI::Wild, SymValueI::Wild) => (),
-//         (SymValueI::Uninit, SymValueI::Uninit) => (),
-//         _ => todo!("differing left and rightss"),
-//     }
-// }
+            fields.iter().enumerate().for_each(|(ix, f)| {
+                let mut base = base.clone();
+                let ty = pty.field_ty(tcx, ix.into());
+                let pty = pty.projection_ty(tcx, ProjectionElem::Field(ix.into(), ty));
+                base.push(ProjectionElem::Field(ix.into(), ty));
+                val_to_place(tcx, local, pty, base, f, out);
+            })
+        }
+        SymValueI::Tuple(ts) => ts.iter().enumerate().for_each(|(ix, f)| {
+            let mut base = base.clone();
+            let ty = pty.field_ty(tcx, ix.into());
+            let pty = pty.projection_ty(tcx, ProjectionElem::Field(ix.into(), ty));
+            base.push(ProjectionElem::Field(ix.into(), ty));
+            val_to_place(tcx, local, pty, base, f, out);
+        }),
+        SymValueI::Box(s) => {
+            base.push(ProjectionElem::Deref);
+            val_to_place(tcx, local, pty, base, &*s, out)
+        }
+        SymValueI::Wild => out.push(Place { local, projection: tcx.mk_place_elems(&base[..]) }),
+        SymValueI::Uninit => (),
+    }
+}
+
+/// Calculate the loop invariant given a state immediately before a loop and a state immediately afterwards.
+fn invariants_between<'tcx>(
+    f: &mut dyn Write,
+    // tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    pre: &Environ<'tcx>,
+    post: &Environ<'tcx>,
+) {
+    let mut changed = HashMap::new();
+    let mut affected_lifetimes: HashMap<_, HashSet<_>> = HashMap::new();
+    for (k, v) in &pre.map {
+        if post.get(*k) != Some(v.clone()) {
+            changed.insert(k, v);
+
+            let rust_ty = body.local_decls[*k].ty;
+            let mut col = RegionCollector::default();
+            col.visit_ty(rust_ty);
+
+            for lft in col.regions {
+                affected_lifetimes.entry(lft).or_default().insert(*k);
+            }
+        }
+    }
+
+    // eprintln!("needing magic wands {:?}", affected_lifetimes);
+
+    for (_, vars) in affected_lifetimes {
+        let mut out = Vec::new();
+        for var in vars {
+
+            // fold_unfold(tcx, FoldUnfold::Unfold, var, pty, Vec::new(), pre, post, &mut Vec::new());
+            diff_terms(
+                WandTerm::Var(var),
+                &pre.get(var).unwrap(),
+                &post.get(var).unwrap(),
+                &mut out,
+            );
+        }
+        let (pres, posts) = out.into_iter().unzip();
+
+        let post = WandTerm::Conj(posts);
+        let pre = WandTerm::Conj(pres);
+        let wand = WandTerm::Wand(Box::new(post), Box::new(pre));
+        writeln!(f, "invariant {wand};").unwrap();
+    }
+}
